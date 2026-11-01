@@ -7,9 +7,10 @@
 //  (b) chain: chosen dead → provider .env default, notify called
 //  (c) chosen + own default dead → other provider's default
 //  (d) everything dead → { provider: null }, every try recorded
-//  (e) processor seam: ensureWorkingModel rewrites the job to the fallback
-//      with an owner notice, leaves a healthy job alone, and throws loudly
-//      (naming every tried model) when nothing answers
+//  (e) conversation seam: ensureWorkingModel rewrites the target selection
+//      to the fallback with an owner notice, leaves a healthy selection
+//      alone, and throws loudly (naming every tried model) when nothing
+//      answers
 //  (f) MODEL_PROBE=off skips the network entirely
 //  (g) PROBE_TIMEOUT_SEC drives the probe timeout (hanging model)
 import assert from 'node:assert';
@@ -55,7 +56,7 @@ process.env.MODELS_CACHE_TTL_SEC = '900';
 delete process.env.MODEL_PROBE;
 
 const { probeModel, resolveWorkingModel, clearProbeCache } = await import('../bot/models.mjs');
-const { ensureWorkingModel } = await import('../bot/processor.mjs');
+const { ensureWorkingModel } = await import('../bot/conversation.mjs');
 
 const hits = (who, model) => counts.get(`${who}|${model}`) || 0;
 

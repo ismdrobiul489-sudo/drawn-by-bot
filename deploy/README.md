@@ -17,8 +17,10 @@ micro VMs are too small for Chromium + ffmpeg rendering).
 4. **Public URL.** Point a domain/subdomain (or the VPS IP) at the store
    port and set `PUBLIC_BASE_URL` — stored masters are linked as
    `PUBLIC_BASE_URL/files/<token>/<file>`.
-5. **Install:** `bash deploy/setup.sh` (Node 20+, ffmpeg, Chromium,
-   edge-tts, OpenCode, systemd unit).
+5. **Install:** `bash install.sh` (Node 20+, ffmpeg, Chromium, edge-tts,
+   OpenCode — and the systemd unit ONLY where systemd exists; without
+   systemd, e.g. in Cloud Shell, that step is skipped and the bot runs
+   via `bash run.sh`).
 6. **⚠️ Edge TTS smoke test ON THE VPS, before anything else:**
    `edge-tts --voice en-US-AriaNeural --text "Hello, this is a test." --write-media /tmp/t.mp3`
    then check the file is non-empty and plays. Edge TTS was **blocked from
@@ -28,11 +30,13 @@ micro VMs are too small for Chromium + ffmpeg rendering).
 7. **OpenCode check:** `opencode --version`, then in the repo:
    `opencode models` should list the groq and nvidia providers from
    `opencode.json` once keys are in `.env`.
-8. **Enable:** `systemctl enable --now drawn-by-bot`, watch
-   `journalctl -u drawn-by-bot -f`, send `/start` to the bot.
-9. **First job:** pick style `line` or `paper-cutout`, 9:16, a short topic.
-   Expect the animatic first; reply with feedback in chat, then press
-   ✅ Final render.
+8. **Enable (systemd hosts):** `systemctl enable --now drawn-by-bot`,
+   watch `journalctl -u drawn-by-bot -f`. Without systemd: `bash run.sh`.
+   Then send `/start` to the bot.
+9. **First video:** just talk to the bot — send a short topic in plain
+   words. Expect the style test and animatic in the chat first; reply
+   with feedback in plain language and it revises in the same
+   conversation.
 10. **Store check:** the delivered message must contain a working backup
     link. Open it from your phone (mobile data, not the VPS network).
 

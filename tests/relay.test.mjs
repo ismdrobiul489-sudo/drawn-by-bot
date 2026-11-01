@@ -7,7 +7,8 @@
 //  (c) a question with options produces one button per option, and tapping
 //      one replies with { answers: [[label]] }; a no-option question takes
 //      the owner's next text message as the answer
-//  (d) the run-driver fallback is selectable via OPENCODE_DRIVER=run
+//  (The old (d) run-driver assertion was removed with the run driver
+//  itself in the conversational rework — serve is the only driver now.)
 import assert from 'node:assert';
 import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -16,7 +17,6 @@ import { join } from 'node:path';
 
 import { AgentServer } from '../bot/agent-server.mjs';
 import { AskRelay } from '../bot/relay.mjs';
-import { openCodeDriver } from '../bot/processor.mjs';
 
 const SID = 'ses_test1';
 const posts = [];       // { path, body } recorded from the driver + relay
@@ -177,13 +177,6 @@ try {
   await withTimeout(turn3, 'free-text question turn');
   console.log('  ✓ (c) no-option question → owner\'s next text message is the answer');
 
-  // (d) run-driver fallback stays selectable.
-  delete process.env.OPENCODE_DRIVER;
-  assert.equal(openCodeDriver(), 'serve');
-  process.env.OPENCODE_DRIVER = 'run';
-  assert.equal(openCodeDriver(), 'run');
-  delete process.env.OPENCODE_DRIVER;
-  console.log('  ✓ (d) OPENCODE_DRIVER=run selects the fallback driver; default is serve');
 } finally {
   relay.dispose();
   agent.stop();

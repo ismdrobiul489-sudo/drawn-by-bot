@@ -33,9 +33,19 @@
 //   GET  /session/status               -> { [sessionID]: { type } } — idle
 //        sessions are ABSENT from the map (verified live).
 //   POST /session/{id}/abort
+//   POST /session?directory=<abs path> — the directory is a QUERY param
+//        (verified live against 1.19.5, 2026-11-01): the created session
+//        is rooted at that directory (Session.directory) even though the
+//        server process itself runs elsewhere. The conversation session
+//        uses this to live at the REPO ROOT while the server keeps its
+//        core/ cwd (the custom tools resolve media/ from that cwd).
 //
 // One server child process is spawned lazily (cwd = core/, exactly like the
 // `opencode run` driver sees the project) and reused across all jobs.
+// If the managed child exits unexpectedly, pending turn waiters are failed
+// with a `serverDied` error and onServerExit listeners fire — the next
+// ensure() call respawns the server, and OpenCode's on-disk sessions
+// survive the restart, so a conversation can re-attach by session id.
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { env, envInt, ROOT } from '../lib/env.mjs';
@@ -60,10 +70,15 @@ export class AgentServer {
     this.progress = new Map();  // sessionId -> onProgress(text) callback
     this.textBuf = new Map();   // sessionId -> recent assistant text
     this.sseCtl = null;         // AbortController of the event stream
+    this.deathListeners = new Set(); // fn({code, signal}) on unexpected child exit
   }
 
   /** Subscribe to ALL server events. Returns an unsubscribe function. */
   onEvent(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+
+  /** Subscribe to unexpected exits of the MANAGED server child (never
+   *  fires for stop() or for externally-run servers). Returns unsubscribe. */
+  onServerExit(fn) { this.deathListeners.add(fn); return () => this.deathListeners.delete(fn); }
 
   /** Progress text callback for one session (assistant text, tail slice). */
   setProgress(sessionId, fn) {
@@ -80,11 +95,22 @@ export class AgentServer {
   /** Make sure the server is up (spawning it if we manage it) and the event
    *  stream is connected. Safe to call before every operation. */
   async ensure() {
-    if (await this.healthy()) { this.connectEvents(); return; }
+    if (await this.healthy()) { this.connectEvents(); await this.waitSse(); return; }
     if (!this.managed) throw new Error(`OpenCode server at ${this.baseUrl} is not reachable.`);
     if (!this.starting) this.starting = this.spawnServer().finally(() => { this.starting = null; });
     await this.starting;
     this.connectEvents();
+    await this.waitSse();
+  }
+
+  /** Bounded wait for the SSE stream to (re)connect. A prompt sent while
+   *  the stream is down LOSES its streamed text (events are not replayed),
+   *  which after a respawn is a real window (~1.5 s reconnect backoff).
+   *  Best-effort: after ~3 s we proceed anyway — the waiter's status
+   *  backstop still completes the turn, just without streamed text. */
+  async waitSse(ms = 3000) {
+    const t0 = Date.now();
+    while (!this.sseConnected && !this.stopped && Date.now() - t0 < ms) await sleep(100);
   }
 
   async spawnServer() {
@@ -97,7 +123,18 @@ export class AgentServer {
       cwd: CORE, env: process.env, stdio: ['ignore', 'ignore', 'pipe'],
     });
     this.child.stderr.on('data', d => process.stderr.write(`[opencode] ${d}`));
-    this.child.on('exit', () => { this.child = null; });
+    this.child.on('exit', (code, signal) => {
+      this.child = null;
+      if (this.stopped) return; // our own stop() — not a death
+      // The server died mid-flight: any turn waiting on it can never
+      // complete (its events are gone), so fail those waiters NOW with a
+      // recognisable error instead of letting them hang to the turn
+      // timeout, and tell subscribers so they can respawn + notify.
+      const err = new Error(`OpenCode server process exited (code ${code ?? '?'}, signal ${signal ?? 'none'})`);
+      err.serverDied = true;
+      for (const sid of [...this.waiters.keys()]) this.failWaiters(sid, err);
+      for (const fn of this.deathListeners) { try { fn({ code, signal }); } catch { /* listener errors are contained */ } }
+    });
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
       if (await this.healthy()) return;
@@ -115,6 +152,7 @@ export class AgentServer {
         try {
           const res = await fetch(`${this.baseUrl}/event`, { signal: ctl.signal, headers: { Accept: 'text/event-stream' } });
           if (!res.ok || !res.body) throw new Error(`event stream HTTP ${res.status}`);
+          this.sseConnected = true;
           const reader = res.body.getReader();
           const dec = new TextDecoder();
           let buf = '';
@@ -132,6 +170,7 @@ export class AgentServer {
             }
           }
         } catch { if (this.stopped) break; }
+        this.sseConnected = false;
         if (!this.stopped) await sleep(1500); // reconnect backoff
       }
       this.sseCtl = null;
@@ -160,15 +199,25 @@ export class AgentServer {
     for (const fn of this.listeners) { try { fn(ev); } catch { /* listener errors never kill the stream */ } }
   }
 
+  /** Is the server reporting this session as actively working? */
+  async sessionBusy(sessionId) {
+    const r = await fetch(`${this.baseUrl}/session/status`, { signal: AbortSignal.timeout(2000) });
+    if (!r.ok) throw new Error(`session/status HTTP ${r.status}`);
+    const map = await r.json();
+    const st = map?.[sessionId];
+    return !!(st && st.type && st.type !== 'idle');
+  }
+
   addWaiter(sessionId, timeoutMs) {
     let entry;
     const promise = new Promise((resolve, reject) => {
-      entry = { resolve, reject, timer: null, cancel: null };
+      entry = { resolve, reject, timer: null, cancel: null, poll: null };
     });
     entry.cancel = () => {
       const set = this.waiters.get(sessionId);
       if (set) { set.delete(entry); if (!set.size) this.waiters.delete(sessionId); }
       if (entry.timer) clearTimeout(entry.timer);
+      if (entry.poll) clearInterval(entry.poll);
     };
     if (timeoutMs > 0) {
       entry.timer = setTimeout(() => {
@@ -177,6 +226,21 @@ export class AgentServer {
         entry.reject(new Error(`OpenCode turn timed out after ${Math.round(timeoutMs / 60000)} min.`));
       }, timeoutMs);
     }
+    // Status-poll BACKSTOP: the session.idle EVENT is the primary signal,
+    // but an event emitted while our SSE stream is briefly disconnected
+    // (e.g. during a server respawn) would otherwise hang this waiter
+    // until the turn timeout. Poll the status endpoint: busy→idle means
+    // the turn ended; never-busy for 5 s after the prompt was accepted
+    // means it finished before we could observe it.
+    entry.startedAt = Date.now();
+    entry.sawBusy = false;
+    entry.poll = setInterval(async () => {
+      try {
+        if (await this.sessionBusy(sessionId)) { entry.sawBusy = true; return; }
+        if (entry.sawBusy || Date.now() - entry.startedAt > 5000) this.settleIdle(sessionId);
+      } catch { /* status hiccup — the event path remains primary */ }
+    }, 900);
+    entry.poll.unref?.();
     if (!this.waiters.has(sessionId)) this.waiters.set(sessionId, new Set());
     this.waiters.get(sessionId).add(entry);
     return { promise, cancel: entry.cancel };
@@ -196,14 +260,14 @@ export class AgentServer {
     const set = this.waiters.get(sessionId);
     if (!set) return;
     this.waiters.delete(sessionId);
-    for (const w of set) { if (w.timer) clearTimeout(w.timer); w.resolve(); }
+    for (const w of set) { if (w.timer) clearTimeout(w.timer); if (w.poll) clearInterval(w.poll); w.resolve(); }
   }
 
   failWaiters(sessionId, err) {
     const set = this.waiters.get(sessionId);
     if (!set) return;
     this.waiters.delete(sessionId);
-    for (const w of set) { if (w.timer) clearTimeout(w.timer); w.reject(err); }
+    for (const w of set) { if (w.timer) clearTimeout(w.timer); if (w.poll) clearInterval(w.poll); w.reject(err); }
   }
 
   async post(path, body) {
@@ -216,15 +280,28 @@ export class AgentServer {
     return res;
   }
 
-  async createSession({ providerID, modelID, agent = 'video-maker', title } = {}) {
+  async createSession({ providerID, modelID, agent = 'video-maker', title, directory } = {}) {
     await this.ensure();
     const body = { agent };
     if (title) body.title = title;
     if (providerID && modelID) body.model = { id: modelID, providerID };
-    const res = await this.post('/session', body);
+    // `directory` is a query param (verified live on 1.19.5): the session
+    // is rooted there — its files, bash and instructions resolve against
+    // it — while the server process keeps its own cwd.
+    const path = directory ? `/session?directory=${encodeURIComponent(directory)}` : '/session';
+    const res = await this.post(path, body);
     const s = await res.json();
     if (!s?.id) throw new Error('OpenCode session create returned no id.');
     return s.id;
+  }
+
+  /** Does this session still exist on the server? (Sessions persist on
+   *  disk across server restarts; a false here means it is really gone.) */
+  async sessionExists(sessionId) {
+    try {
+      const r = await fetch(`${this.baseUrl}/session/${sessionId}`, { signal: AbortSignal.timeout(3000) });
+      return r.ok;
+    } catch { return false; }
   }
 
   /** Send one user turn and wait until the session goes idle (the agent may

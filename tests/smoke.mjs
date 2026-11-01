@@ -115,4 +115,12 @@ const tpmCode = await new Promise(resolve => {
 });
 assert.equal(tpmCode, 0, 'TPM fallback test failed');
 passed++;
+
+console.log('— OpenCode server death + respawn (child process, fake opencode binary) —');
+const deathCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/serverdeath.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(deathCode, 0, 'server death test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

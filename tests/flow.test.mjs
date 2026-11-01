@@ -1,279 +1,583 @@
-// Flow test: run the real bot against a MOCK Telegram API (local server) and
-// drive /start → mode → content → style → aspect → voice → confirm with
-// canned updates. Provider/model are NEVER steps: jobs silently use the
-// saved current selection (initialised from .env); /model is the only
-// place it changes — the test drives that too, plus a following job.
-// Groq/NVIDIA /models are mocked. The queued jobs will fail during
-// processing (no real providers/opencode here) — that graceful failure
-// is expected and cleaned up.
-import assert from 'node:assert';
+// flow group — the CONVERSATIONAL bot, end to end against mocks.
+//
+// Spawns the real bot (bot/bot.mjs) as a child process with:
+//   • a mock Telegram Bot API (records every call the bot makes),
+//   • a mock OpenCode serve (scriptable sessions/prompts; can raise
+//     question.asked events and scripted assistant replies),
+//   • mock provider /models + /chat/completions (probes + model lists).
+//
+// Covers: (a) plain text → turn with the standing model, reply delivered,
+// NO /start anywhere; (b) a message during a busy turn is queued and
+// delivered after; (c) /new archives + fresh session, /model switches the
+// standing selection and the next turn uses it; (d) question.asked →
+// buttons → answer returns; (e) a send_file request in data/outbox/ is
+// sent by the bot watcher; (f) first-turn TPM → switch + persistent
+// notice + retried turn succeeds; (g) the owner lock rejects strangers;
+// plus /start status, voice intake (transcribed + forwarded), the
+// claims-but-didn't-deliver nudge (amendment A3), and old-state migration.
+//
+// NOTE: the bot resolves data/ from the REPO root (lib/env ROOT), so the
+// tests snapshot the real data/state.json before boot and restore it
+// after — the repo's own state is never clobbered by a test run.
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const ROOT = join(import.meta.dirname, '..');
-const sent = [];
-const calls = []; // every JSON API call the bot makes: { method, params }
-let pending = [];
-let updateId = 0;
-const upd = u => { pending.push({ update_id: ++updateId, ...u }); };
-const msg = text => ({ message: { message_id: updateId + 500, chat: { id: 42 }, from: { id: 42 }, text } });
-const cb = data => ({ callback_query: { id: `q${updateId}`, from: { id: 42 }, message: { chat: { id: 42 }, message_id: 1 }, data } });
-
-const server = createServer((req, res) => {
-  let body = '';
-  req.on('data', d => { body += d; });
-  req.on('end', () => {
-    res.setHeader('Content-Type', 'application/json');
-    const url = req.url;
-    if (url.endsWith('/models')) { // provider /models mocks
-      if (url.includes('/nvidia')) {
-        res.end(JSON.stringify({ data: [
-          { id: 'nvidia/nemotron-3-super-120b-a12b' }, { id: 'z-ai/glm-5.3' },
-          { id: 'deepseek-ai/deepseek-v4-flash' }, { id: 'nvidia/nvclip' },
-        ] }));
-      } else {
-        res.end(JSON.stringify({ data: [
-          { id: 'openai/gpt-oss-120b' }, { id: 'whisper-large-v3' },
-          { id: 'canopylabs/orpheus-v1-english' }, { id: 'qwen/qwen3.8-27b' },
-        ] }));
-      }
-      return;
-    }
-    if (url.endsWith('/chat/completions')) {
-      // Model probes must ALL fail in this env: if any fallback candidate
-      // answered, the processor's (correct) probe/dead-model machinery
-      // would rewrite the job's provider/model after the OpenCode failure,
-      // and the jobs.json assertions below check the ENQUEUE-time
-      // selection. So jobs fail at the pre-flight probe instead — still a
-      // graceful, expected failure. /models above stays live for /model.
-      res.statusCode = 404;
-      res.end(JSON.stringify({ error: { message: 'model not provisioned (mock)' } }));
-      return;
-    }
-    const method = url.split('/').pop();
-    let params = {};
-    try { params = JSON.parse(body || '{}'); } catch { /* multipart */ }
-    calls.push({ method, params });
-    if (method === 'getUpdates') {
-      const out = pending; pending = [];
-      res.end(JSON.stringify({ ok: true, result: out }));
-      return;
-    }
-    if (method === 'sendMessage') sent.push(params);
-    res.end(JSON.stringify({ ok: true, result: { message_id: 1000 + sent.length } }));
-  });
-});
-await new Promise(r => server.listen(0, r));
-const port = server.address().port;
-
-const env = {
-  ...process.env,
-  TELEGRAM_BOT_TOKEN: 'test-token',
-  TELEGRAM_API_BASE: `http://127.0.0.1:${port}`,
-  OWNER_TELEGRAM_ID: '42',
-  GROQ_API_KEY: 'test-key',
-  GROQ_BASE_URL: `http://127.0.0.1:${port}/groq`,
-  NVIDIA_API_KEY: 'test-key',
-  NVIDIA_BASE_URL: `http://127.0.0.1:${port}/nvidia`,
-  OPENCODE_BIN: '/nonexistent/opencode', // job must fail fast & gracefully in this env
-  STORE_PORT: '0',
-  MODELS_CACHE_TTL_SEC: '900',
-};
-const bot = spawn('node', ['bot/bot.mjs'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
-bot.stderr.on('data', d => process.stderr.write(`[bot] ${d}`));
-
+const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const OWNER = 4242;
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function waitFor(pred, what, timeoutMs = 15000) {
+
+async function waitFor(fn, what, ms = 30000) {
   const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    if (pred()) return;
-    await sleep(150);
-  }
-  throw new Error(`timeout waiting for: ${what}\nsent so far: ${JSON.stringify(sent.map(s => s.text?.slice(0, 60)))}`);
+  for (;;) { const v = fn(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timeout waiting for ${what}`); await sleep(80); }
 }
-const hasText = frag => () => sent.some(s => (s.text || '').includes(frag));
-const lastKb = frag => sent.filter(s => (s.text || '').includes(frag)).pop()?.reply_markup;
-const countText = frag => sent.filter(s => (s.text || '').includes(frag)).length;
-const jobsDb = () => { try { return JSON.parse(readFileSync(join(ROOT, 'data', 'jobs.json'), 'utf8')); } catch { return { queue: [], history: [], active: null }; } };
-const allJobs = () => { const db = jobsDb(); return [...(db.active ? [db.active] : []), ...db.queue, ...db.history]; };
 
-try {
-  upd(msg('/start'));
-  await waitFor(hasText('What will you give'), 'mode keyboard');
-  assert.ok(JSON.stringify(lastKb('What will you give')).includes('mode:topic'));
+function readJsonBody(req) {
+  return new Promise(resolveBody => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => { try { resolveBody(JSON.parse(Buffer.concat(chunks).toString() || '{}')); } catch { resolveBody({}); } });
+  });
+}
 
-  // (a) The bot registered its command menu with Telegram at boot.
-  const sc = calls.find(c => c.method === 'setMyCommands');
-  assert.ok(sc, 'setMyCommands was called at boot');
-  assert.deepEqual(sc.params.commands, [
-    { command: 'start', description: 'Start the video maker' },
-    { command: 'new', description: 'Start a new video job' },
-    { command: 'topic', description: 'New video from a topic' },
-    { command: 'script', description: 'New video from your script' },
-    { command: 'voice', description: 'Make a video from your voice script' },
-    { command: 'model', description: 'Change the current model' },
-    { command: 'cancel', description: 'Cancel the current setup' },
-    { command: 'help', description: 'How this bot works' },
-  ]);
-  console.log('  ✓ setMyCommands registered the 8-command menu at boot');
+// ── Mock provider (groq + nvidia on one server, split by path) ─────────────
+function makeProvider({ groqList, nvidiaList, probeBehavior }) {
+  const probes = [];
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const reply = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json ?? {})); };
+    if (req.method === 'GET' && url.pathname === '/groq/models') return reply(200, { data: groqList.map(id => ({ id })) });
+    if (req.method === 'GET' && url.pathname === '/nvidia/models') return reply(200, { data: nvidiaList.map(id => ({ id })) });
+    if (req.method === 'POST' && /^\/(groq|nvidia)\/chat\/completions$/.test(url.pathname)) {
+      const body = await readJsonBody(req);
+      probes.push({ provider: url.pathname.split('/')[1], model: body.model });
+      const b = probeBehavior(body.model);
+      if (b && b.status) return reply(b.status, { error: { message: b.message || 'probe failed' } });
+      return reply(200, { choices: [{ message: { content: 'ok' } }] });
+    }
+    if (req.method === 'POST' && url.pathname === '/groq/audio/transcriptions') {
+      await readJsonBody(req).catch(() => {});
+      return reply(200, {
+        text: 'This is my recorded narration.', language: 'en', duration: 3,
+        segments: [{ start: 0, end: 3, text: 'This is my recorded narration.' }],
+        words: [
+          { word: 'This', start: 0, end: 0.4 }, { word: 'is', start: 0.5, end: 0.7 },
+          { word: 'my', start: 0.8, end: 1 }, { word: 'recorded', start: 1.1, end: 1.8 },
+          { word: 'narration.', start: 1.9, end: 2.8 },
+        ],
+      });
+    }
+    return reply(404, { error: 'no route ' + req.method + ' ' + url.pathname });
+  });
+  return { server, probes };
+}
 
-  // A stranger is ignored:
-  pending.push({ update_id: ++updateId, message: { message_id: 1, chat: { id: 99 }, from: { id: 99 }, text: '/start' } });
-  await sleep(600);
-  assert.ok(!sent.some(s => s.chat_id === 99), 'stranger must be ignored');
+// ── Mock OpenCode serve ─────────────────────────────────────────────────────
+function makeOpenCode({ onPrompt, replyFor }) {
+  const state = { sessions: [], prompts: [], subscribers: new Set(), questions: new Map() };
+  const emit = ev => { for (const res of [...state.subscribers]) { try { res.write(`data: ${JSON.stringify(ev)}\n\n`); } catch {} } };
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const p = url.pathname;
+    if (req.method === 'GET' && p === '/event') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      state.subscribers.add(res);
+      req.on('close', () => state.subscribers.delete(res));
+      return;
+    }
+    const reply = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json ?? {})); };
+    if (req.method === 'GET' && p === '/global/health') return reply(200, { healthy: true, version: 'mock' });
+    if (req.method === 'GET' && p === '/session/status') return reply(200, {}); // {} = every session idle (AgentServer.healthy + busy checks)
+    if (req.method === 'POST' && p === '/session') {
+      await readJsonBody(req);
+      const sid = `ses_mock_${state.sessions.length + 1}`;
+      const s = { id: sid, directory: url.searchParams.get('directory') || '' };
+      state.sessions.push(s);
+      return reply(200, { id: sid, title: 'mock', directory: s.directory });
+    }
+    if (req.method === 'GET' && /^\/session\/[^/]+$/.test(p)) {
+      const s = state.sessions.find(x => x.id === p.split('/')[2]);
+      return s ? reply(200, s) : reply(404, { error: 'no session' });
+    }
+    if (req.method === 'POST' && p.includes('/prompt_async')) {
+      const body = await readJsonBody(req);
+      const sid = p.split('/')[2];
+      state.prompts.push({ sid, body });
+      const action = onPrompt ? onPrompt({ sid, body, n: state.prompts.length }) : null;
+      if (action?.error) return reply(action.error.status || 500, { error: { message: action.error.message } });
+      const finish = () => {
+        const text = action?.text ?? replyFor(body);
+        const mid = `msg_${state.prompts.length}_${Date.now()}`;
+        emit({ type: 'message.part.delta', properties: { sessionID: sid, messageID: mid, partID: 'p1', field: 'text', delta: text } });
+        emit({ type: 'session.idle', properties: { sessionID: sid } });
+      };
+      setTimeout(finish, action?.delayMs ?? 30);
+      return reply(204, {});
+    }
+    if (req.method === 'POST' && p.includes('/abort')) return reply(200, true);
+    if (req.method === 'POST' && /^\/question\/[^/]+\/reply$/.test(p)) {
+      const body = await readJsonBody(req);
+      state.questions.set(p.split('/')[2], body.answers);
+      return reply(200, true);
+    }
+    if (req.method === 'POST' && /^\/permission\/[^/]+\/reply$/.test(p)) return reply(200, true);
+    return reply(404, { error: 'no route ' + req.method + ' ' + p });
+  });
+  state.askQuestion = (sid, request) => {
+    emit({ type: 'question.asked', properties: { id: request.id, sessionID: sid, questions: request.questions, tool: { messageID: 'm', callID: 'c' } } });
+  };
+  return { server, state };
+}
 
-  upd(cb('mode:topic'));
-  await waitFor(hasText('Type your topic'), 'topic prompt');
-  upd(msg('test topic about rain'));
-  // NO provider/model steps any more: content goes straight to style.
-  await waitFor(hasText('Select a style'), 'style list right after content');
-  assert.ok(!hasText('Which provider')(), 'no provider prompt in the job flow');
-  assert.ok(!hasText('Select a model')(), 'no model prompt in the job flow');
-  assert.ok(JSON.stringify(lastKb('Select a style')).includes('style:line'));
+// ── Mock Telegram ───────────────────────────────────────────────────────────
+function makeTelegram() {
+  const calls = [];
+  const updates = [];
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    // File downloads live on the same base as the API (real Telegram
+    // layout): GET /file/bot<token>/<file_path> → the file bytes.
+    if (req.method === 'GET' && url.pathname.startsWith('/file/')) {
+      res.writeHead(200, { 'content-type': 'audio/wav' });
+      res.end(tinyWav());
+      return;
+    }
+    // Multipart calls (sendVideo/sendPhoto/sendDocument) carry their
+    // fields as form parts — extract the text fields so tests can
+    // assert captions; JSON calls parse as before.
+    let body = {};
+    if ((req.headers['content-type'] || '').includes('multipart/form-data')) {
+      const raw = await new Promise(r => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => r(Buffer.concat(c).toString('utf8'))); });
+      for (const m of raw.matchAll(/name="(\w+)"\r\n\r\n([^\r]*)/g)) { try { body[m[1]] = JSON.parse(m[2]); } catch { body[m[1]] = m[2]; } }
+    } else {
+      body = await readJsonBody(req);
+    }
+    const reply = (json) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(json)); };
+    const method = url.pathname.split('/').pop(); // strip the /bot<token> prefix
+    if (method === 'getUpdates') {
+      // Telegram offset semantics: offset = last seen id + 1; updates
+      // with id >= offset are (re)delivered.
+      let mine = updates.filter(u => u.update_id >= (body.offset || 0)).slice(0, 10);
+      if (!mine.length) {
+        // Simulate Telegram long-polling: hold the request briefly so
+        // the bot's poll loop doesn't spin hot against an instant mock.
+        await sleep(400);
+        mine = updates.filter(u => u.update_id >= (body.offset || 0)).slice(0, 10);
+      }
+      return reply({ ok: true, result: mine });
+    }
+    if (method === 'getMe') return reply({ ok: true, result: { id: 1, is_bot: true, first_name: 'Mock' } });
+    if (method === 'getFile') return reply({ ok: true, result: { file_id: body.file_id, file_path: 'voice/file_1.oga' } });
+    calls.push({ method, ...body });
+    return reply({ ok: true, result: { message_id: calls.length } });
+  });
+  let uid = 1000;
+  const push = u => updates.push({ update_id: ++uid, ...u });
+  return {
+    server, calls, updates,
+    say: text => push({ message: { message_id: uid, chat: { id: OWNER }, from: { id: OWNER }, text } }),
+    sayAs: (id, text) => push({ message: { message_id: uid, chat: { id }, from: { id }, text } }),
+    voice: () => push({ message: { message_id: uid, chat: { id: OWNER }, from: { id: OWNER }, voice: { file_id: 'voice-file-1', duration: 3, mime_type: 'audio/ogg' } } }),
+    tap: data => push({ callback_query: { id: `cb${uid}`, from: { id: OWNER }, message: { message_id: 1, chat: { id: OWNER } }, data } }),
+    sent: () => calls.filter(c => c.method === 'sendMessage'),
+    texts: () => calls.filter(c => c.method === 'sendMessage').map(c => c.text || ''),
+  };
+}
 
-  upd(cb('style:line'));
-  await waitFor(hasText('Aspect ratio'), 'aspect');
-  upd(cb('aspect:9:16'));
-  await waitFor(hasText('Which voice'), 'voice list (fallback ok)');
-  upd(cb('voice:0'));
-  await waitFor(hasText('Job summary'), 'confirm card');
-  const summary = sent.filter(s => (s.text || '').includes('Job summary')).pop().text;
-  assert.ok(summary.includes('line') && summary.includes('9:16'));
-  assert.ok(summary.includes('🤖 groq / openai/gpt-oss-120b'), 'confirm shows the .env-default current model as a plain info line');
-  assert.ok(summary.includes('/model'), 'confirm info line names /model as the only place to change it');
+// A tiny valid WAV (0.1s silence) so ffprobe/ffmpeg accept the "voice" file.
+function tinyWav() {
+  const sr = 8000, n = 800, dataLen = n * 2;
+  const buf = Buffer.alloc(44 + dataLen);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataLen, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(sr, 24); buf.writeUInt32LE(sr * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write('data', 36); buf.writeUInt32LE(dataLen, 40);
+  return buf;
+}
 
-  upd(cb('confirm'));
-  await waitFor(hasText('queue'), 'queued message');
-  const j1 = allJobs().find(j => (j.inputText || '').includes('rain'));
-  assert.ok(j1, 'job-1 persisted to jobs.json');
-  assert.equal(j1.provider, 'groq', 'job-1 carries the .env-default provider');
-  assert.equal(j1.model, 'openai/gpt-oss-120b', 'job-1 carries the .env-default model');
-  console.log('  ✓ flow: /start → mode → content → style → aspect → voice → confirm → queue (no provider/model steps)');
-  console.log('  ✓ job carries the .env-default selection; confirm shows it as an info line');
-  console.log('  ✓ owner-only lock verified (stranger ignored)');
+// ── Bot child harness ───────────────────────────────────────────────────────
+const REAL_STATE = join(ROOT, 'data', 'state.json');
+const REAL_PENDING = join(ROOT, 'data', 'pending.json');
+const REAL_MEMORY = join(ROOT, 'data', 'memory');
+let savedRealState = null;
+let savedRealPending = null;
+let savedMemory = null; // { 'preferences.md': string|null, 'index.md': string|null }
+function snapshotRealState() {
+  savedRealState = existsSync(REAL_STATE) ? readFileSync(REAL_STATE, 'utf8') : null;
+  savedRealPending = existsSync(REAL_PENDING) ? readFileSync(REAL_PENDING, 'utf8') : null;
+  savedMemory = {};
+  for (const f of ['preferences.md', 'index.md']) {
+    const p = join(REAL_MEMORY, f);
+    savedMemory[f] = existsSync(p) ? readFileSync(p, 'utf8') : null;
+    rmSync(p, { force: true });
+  }
+  rmSync(REAL_STATE, { force: true });
+  rmSync(REAL_PENDING, { force: true }); // a leftover pending ask would be re-sent at boot and pollute assertions
+}
+function restoreRealState() {
+  if (savedRealState === null) rmSync(REAL_STATE, { force: true });
+  else writeFileSync(REAL_STATE, savedRealState);
+  if (savedRealPending === null) rmSync(REAL_PENDING, { force: true });
+  else writeFileSync(REAL_PENDING, savedRealPending);
+  if (savedMemory) for (const [f, content] of Object.entries(savedMemory)) {
+    const p = join(REAL_MEMORY, f);
+    if (content === null) rmSync(p, { force: true });
+    else { mkdirSync(REAL_MEMORY, { recursive: true }); writeFileSync(p, content); }
+  }
+}
+/** Seed data/memory/ (call AFTER snapshotRealState, before bootBot). */
+function seedMemory(prefs, indexLines) {
+  mkdirSync(REAL_MEMORY, { recursive: true });
+  if (prefs != null) writeFileSync(join(REAL_MEMORY, 'preferences.md'), prefs);
+  if (indexLines != null) writeFileSync(join(REAL_MEMORY, 'index.md'), indexLines);
+}
+const readState = () => JSON.parse(readFileSync(REAL_STATE, 'utf8'));
 
-  // (b) /help returns the explainer.
-  upd(msg('/help'));
-  await waitFor(hasText('How this bot works'), 'help text');
-  const helpText = sent.filter(s => (s.text || '').includes('How this bot works')).pop().text;
-  assert.ok(helpText.includes('Topic') && helpText.includes('Script') && helpText.includes('Voice'), 'help names the 3 modes');
-  assert.ok(helpText.includes('buttons'), 'help says everything runs by buttons');
-  assert.ok(helpText.includes('feedback'), 'help explains plain-text feedback');
-  assert.ok(helpText.includes('/model'), 'help mentions /model factually');
-  assert.ok(!helpText.includes('per job'), 'help no longer describes per-job model picking');
-  console.log('  ✓ /help returns the explainer');
+async function bootBot({ ocBehavior, probes = {} } = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), 'dbb-flow-'));
+  mkdirSync(join(tmp, 'core', 'sandbox'), { recursive: true });
 
-  // (c) /cancel mid-setup clears the draft/step: start a script setup,
-  // cancel at the content step, then plain text must NOT be taken as the
-  // script (it would advance to the style step) — it hits the fallback.
-  const modesBefore = countText('What will you give');
-  upd(msg('/start'));
-  await waitFor(() => countText('What will you give') > modesBefore, 'mode keyboard again');
-  upd(cb('mode:script'));
-  await waitFor(hasText('Type the full script'), 'script content prompt');
-  upd(msg('/cancel'));
-  await waitFor(hasText('Setup cancelled'), 'cancel reply');
-  upd(msg('this text must not become a script'));
-  await waitFor(hasText('Press /start to begin a new video.'), 'fallback after cancel — old step is gone');
-  assert.equal(countText('Select a style'), 1, 'cancelled setup did not advance to the style step');
-  console.log('  ✓ /cancel mid-setup clears state (plain text no longer continues the old step)');
+  const tg = makeTelegram();
+  const oc = makeOpenCode(ocBehavior);
+  const prov = makeProvider({
+    groqList: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'whisper-large-v3'],
+    nvidiaList: ['nvidia/nemotron-3-super-120b-a12b', 'z-ai/glm-5.3'],
+    probeBehavior: model => probes[model] || null,
+  });
+  for (const s of [tg.server, oc.server, prov.server]) await new Promise(r => s.listen(0, '127.0.0.1', r));
+  const env = {
+    ...process.env,
+    TELEGRAM_BOT_TOKEN: 'TEST',
+    TELEGRAM_API_BASE: `http://127.0.0.1:${tg.server.address().port}`,
+    OWNER_TELEGRAM_ID: String(OWNER),
+    OPENCODE_SERVER_URL: `http://127.0.0.1:${oc.server.address().port}`,
+    OPENCODE_SERVER_CWD: join(tmp, 'core'),
+    OPENCODE_BIN: 'true',
+    GROQ_API_KEY: 'gsk_test', NVIDIA_API_KEY: 'nvapi_test',
+    GROQ_BASE_URL: `http://127.0.0.1:${prov.server.address().port}/groq`,
+    NVIDIA_BASE_URL: `http://127.0.0.1:${prov.server.address().port}/nvidia`,
+    DEFAULT_PROVIDER: 'groq',
+    GROQ_DEFAULT_MODEL: 'openai/gpt-oss-120b',
+    NVIDIA_DEFAULT_MODEL: 'nvidia/nemotron-3-super-120b-a12b',
+    PUBLIC_BASE_URL: '', STORE_PORT: '0',
+    ASK_REMIND_MIN: '6000',
+    MODEL_PROBE: 'on',
+  };
+  const child = spawn(process.execPath, [join(ROOT, 'bot', 'bot.mjs')], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.log = '';
+  child.stdout.on('data', d => { child.log += d; });
+  child.stderr.on('data', d => { child.log += d; });
+  return { tmp, tg, oc, prov, child, servers: [tg.server, oc.server, prov.server] };
+}
 
-  // (d) /script jumps straight into script mode (no menu): the next text
-  // is taken as the script and lands at the style step, mode 'script'.
-  const draftMode = () => JSON.parse(readFileSync(join(ROOT, 'data', 'state.json'), 'utf8'))['42'].draft.mode;
-  const scriptPrompts = countText('Type the full script');
-  const stylesSeen = countText('Select a style');
-  upd(msg('/script'));
-  await waitFor(() => countText('Type the full script') > scriptPrompts, 'script prompt via /script');
-  upd(msg('the quick brown fox narrates this video'));
-  await waitFor(() => countText('Select a style') > stylesSeen, 'style step right after /script text');
-  assert.equal(draftMode(), 'script');
-  console.log('  ✓ /script → text lands at style step with draft mode script');
+async function killBot(h) {
+  if (process.env.DBB_DEBUG) console.log('\n--- bot child log ---\n' + h.child.log.slice(-3000) + '\n--- end bot log ---');
+  h.child.kill('SIGKILL');
+  await Promise.race([new Promise(r => h.child.once('exit', r)), sleep(3000)]);
+  for (const s of h.servers) s.close();
+  rmSync(h.tmp, { recursive: true, force: true });
+}
 
-  // (e) /topic likewise — and it works from mid-setup (style step of
-  // the /script flow above), starting a fresh draft with mode 'topic'.
-  const topicPrompts = countText('Type your topic');
-  const stylesSeen2 = countText('Select a style');
-  upd(msg('/topic'));
-  await waitFor(() => countText('Type your topic') > topicPrompts, 'topic prompt via /topic');
-  upd(msg('why the moon changes shape'));
-  await waitFor(() => countText('Select a style') > stylesSeen2, 'style step right after /topic text');
-  assert.equal(draftMode(), 'topic');
-  console.log('  ✓ /topic → text lands at style step with draft mode topic');
+// (a) plain text → turn with standing model; reply delivered; NO /start.
+test('(a) plain text becomes a turn; reply delivered; no /start needed', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'Hello from the agent — noted!' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('Make a video about monsoon rain');
+    const prompt = await waitFor(() => h.oc.state.prompts[0], 'first prompt');
+    const promptText = prompt.body.parts.map(p => p.text || '').join('\n');
+    assert(promptText.includes('monsoon rain'), 'owner text forwarded');
+    assert(promptText.includes('data/memory/preferences.md'), 'first turn of a fresh session carries the orientation note');
+    assert(prompt.body.model.providerID === 'groq' && prompt.body.model.modelID === 'openai/gpt-oss-120b', 'standing model used');
+    assert(prompt.body.agent === 'video-maker', 'video-maker agent');
+    assert(h.oc.state.sessions[0].directory === ROOT, `session directory is the repo root (got ${h.oc.state.sessions[0].directory})`);
+    await waitFor(() => h.tg.texts().some(t => t.includes('Hello from the agent')), 'assistant reply delivered to Telegram');
+    assert(!h.tg.texts().some(t => t.includes('Press /' + 'start')), 'the old press-start text appears nowhere');
+  } finally { await killBot(h); restoreRealState(); }
+});
 
-  // (f) /voice jumps into voice mode, and its prompt frames the input as
-  // a voice SCRIPT — the owner's full recorded narration, video built
-  // from his own audio — not a casual "voice note" to transcribe only.
-  upd(msg('/voice'));
-  await waitFor(hasText('Send your voice script'), 'voice prompt via /voice');
-  const voicePrompt = sent.filter(s => (s.text || '').includes('Send your voice script')).pop().text;
-  assert.ok(voicePrompt.includes('your audio stays as the narration'), 'voice prompt: his audio is the narration');
-  assert.ok(voicePrompt.includes('No script writing, no TTS'), 'voice prompt: no script generation, no TTS');
-  assert.equal(draftMode(), 'voice');
-  console.log('  ✓ /voice → prompt asks for a voice script, draft mode voice');
+// (b) message during a busy turn is queued, delivered after.
+test('(b) a message during a busy turn is queued and delivered after', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: {
+    onPrompt: ({ n }) => n === 1 ? { delayMs: 900, text: 'first done' } : null,
+    replyFor: () => 'later reply',
+  } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('start the rain video');
+    await waitFor(() => h.oc.state.prompts.length === 1, 'first prompt sent');
+    h.tg.say('also add thunder sounds');
+    await waitFor(() => h.tg.texts().some(t => t.toLowerCase().includes('queued')), 'queued note shown');
+    const second = await waitFor(() => h.oc.state.prompts[1], 'queued message delivered as next turn');
+    assert(second.body.parts[0].text.includes('thunder'), 'queued text forwarded');
+    assert(second.sid === h.oc.state.prompts[0].sid, 'same session');
+  } finally { await killBot(h); restoreRealState(); }
+});
 
-  // (g) /model — the ONLY place the selection changes. It opens from the
-  // owner's own command, shows the current (.env-default) selection,
-  // switches provider, picks a model from the mocked live list, and the
-  // FOLLOWING job then uses the new selection.
-  const selOf = () => JSON.parse(readFileSync(join(ROOT, 'data', 'state.json'), 'utf8'))['42'].selection;
-  upd(msg('/model'));
-  await waitFor(hasText('Current model:'), '/model shows the current selection');
-  const pickerMsg = sent.filter(s => (s.text || '').includes('Current model:')).pop();
-  assert.ok(pickerMsg.text.includes('groq / openai/gpt-oss-120b'), 'picker shows the .env-default selection');
-  assert.ok(JSON.stringify(pickerMsg.reply_markup).includes('mprov:nvidia'), 'picker offers the other provider');
+// (c) /new + /model.
+test('(c) /new starts a fresh session; /model switches and the next turn uses it', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'ok' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('first conversation message');
+    await waitFor(() => h.oc.state.prompts.length === 1, 'prompt 1');
+    const sid1 = h.oc.state.prompts[0].sid;
+    await waitFor(() => h.tg.texts().some(t => t === 'ok'), 'reply 1');
+    h.tg.say('/new');
+    await waitFor(() => h.tg.texts().some(t => t.includes('Fresh conversation')), '/new confirm');
+    h.tg.say('second conversation message');
+    const p2 = await waitFor(() => h.oc.state.prompts[1], 'prompt 2');
+    assert(p2.sid !== sid1, 'fresh session after /new');
+    await waitFor(() => h.tg.texts().filter(t => t === 'ok').length === 2, 'reply 2');
+    h.tg.say('/model');
+    await waitFor(() => h.tg.texts().some(t => t.includes('Current model: groq')), 'picker shows current');
+    h.tg.tap('mprov:nvidia');
+    await waitFor(() => h.tg.texts().some(t => t.includes('Select a model (NVIDIA')), 'model list shown');
+    const models = readState()[OWNER].models;
+    h.tg.tap(`mmodel:${models.indexOf('z-ai/glm-5.3')}`);
+    await waitFor(() => h.tg.texts().some(t => t.includes('Current model set to nvidia / z-ai/glm-5.3')), 'switch confirmed');
+    h.tg.say('third message');
+    const p3 = await waitFor(() => h.oc.state.prompts[2], 'prompt 3');
+    assert(p3.body.model.providerID === 'nvidia' && p3.body.model.modelID === 'z-ai/glm-5.3', 'next turn uses the new standing model');
+  } finally { await killBot(h); restoreRealState(); }
+});
 
-  // The current provider's list stars the current model.
-  upd(cb('mprov:groq'));
-  await waitFor(hasText('Select a model'), 'live Groq model list inside /model');
-  const groqKb = JSON.stringify(lastKb('Select a model'));
-  assert.ok(groqKb.includes('gpt-oss-120b') && groqKb.includes('⭐'), 'current model starred in its provider list');
-  assert.ok(!groqKb.includes('whisper'), 'whisper filtered out of chat models');
+// (d) question relay inside a conversation turn.
+test('(d) agent question → buttons → answer returns to the session', async () => {
+  snapshotRealState();
+  let ocRef = null;
+  const h = await bootBot({ ocBehavior: {
+    onPrompt: ({ sid, n }) => {
+      if (n === 1) setTimeout(() => ocRef.state.askQuestion(sid, { id: 'q_1', questions: [{ question: 'Which aspect?', header: 'Aspect', options: [{ label: '9:16', description: 'vertical' }, { label: '16:9', description: 'wide' }] }] }), 150);
+      return null;
+    },
+    replyFor: () => 'working on it',
+  } });
+  ocRef = h.oc;
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('make a video about tea');
+    const askMsg = await waitFor(() => h.tg.sent().find(m => (m.text || '').includes('Which aspect?')), 'question shown as buttons');
+    assert(JSON.stringify(askMsg.reply_markup).includes('q:q_1:0'), 'answer buttons present');
+    h.tg.tap('q:q_1:0');
+    await waitFor(() => h.oc.state.questions.get('q_1'), 'answer returned to OpenCode');
+    assert(JSON.stringify(h.oc.state.questions.get('q_1')) === JSON.stringify([['9:16']]), 'answer payload correct');
+  } finally { await killBot(h); restoreRealState(); }
+});
 
-  upd(cb('mpick'));
-  await waitFor(() => countText('Current model:') >= 2, 'back at the provider picker');
-  upd(cb('mprov:nvidia'));
-  await waitFor(() => countText('Select a model') >= 2, 'live NVIDIA model list inside /model');
-  const nvidiaKb = JSON.stringify(lastKb('Select a model'));
-  assert.ok(nvidiaKb.includes('nemotron-3-super-120b-a12b'), 'NVIDIA model listed');
-  assert.ok(!nvidiaKb.includes('nvclip'), 'non-chat NVIDIA model filtered out');
-  // Sorted list: deepseek(0), nemotron(1), glm(2) — pick glm, NOT the default.
-  upd(cb('mmodel:2'));
-  await waitFor(hasText('Current model set to nvidia / z-ai/glm-5.3'), 'switch confirmation text');
-  assert.deepEqual(selOf(), { provider: 'nvidia', model: 'z-ai/glm-5.3' }, 'selection persisted in state.json');
-  console.log('  ✓ /model: shows current, switches provider + model from the live list, persists the selection');
+// (e) send_file outbox → bot watcher sends; delivery suppresses the nudge.
+test('(e) a send_file request in data/outbox is sent by the bot watcher', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: {
+    onPrompt: () => null,
+    replyFor: () => 'Your video is ready — sending it now.',
+  } });
+  const videoPath = join(ROOT, 'data', 'outbox', '.test-video.mp4');
+  const reqPath = join(ROOT, 'data', 'outbox', 'test-req.json');
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('make the rain video');
+    await waitFor(() => h.oc.state.prompts.length === 1, 'turn started');
+    // Simulate the agent using the send_file tool mid-turn.
+    writeFileSync(videoPath, Buffer.alloc(2048, 7));
+    writeFileSync(reqPath, JSON.stringify({ path: 'data/outbox/.test-video.mp4', caption: 'Rain video — final' }));
+    const send = await waitFor(() => h.tg.calls.find(c => c.method === 'sendVideo'), 'sendVideo call by the watcher');
+    assert(send.caption === 'Rain video — final', 'caption carried');
+    await waitFor(() => existsSync(join(ROOT, 'data', 'outbox', 'done', 'test-req.json')), 'request marked done');
+    await sleep(3200);
+    assert(h.oc.state.prompts.length === 1, `no nudge turn when delivery happened (prompts=${h.oc.state.prompts.length})`);
+  } finally {
+    await killBot(h); restoreRealState();
+    rmSync(videoPath, { force: true }); rmSync(reqPath, { force: true });
+    rmSync(join(ROOT, 'data', 'outbox', 'done', 'test-req.json'), { force: true });
+    rmSync(join(ROOT, 'data', 'outbox', 'done', 'test-req.result.json'), { force: true });
+  }
+});
 
-  // A job started now uses the new selection — on the confirm card and
-  // in the persisted job.
-  upd(msg('/topic'));
-  await waitFor(hasText('Type your topic'), 'topic prompt (post-switch job)');
-  upd(msg('a lighthouse in a storm'));
-  await waitFor(hasText('Select a style'), 'style step (post-switch job)');
-  upd(cb('style:line'));
-  await waitFor(hasText('Aspect ratio'), 'aspect (post-switch job)');
-  upd(cb('aspect:16:9'));
-  await waitFor(hasText('Which voice'), 'voice list (post-switch job)');
-  upd(cb('voice:0'));
-  await waitFor(() => countText('Job summary') >= 2, 'confirm card (post-switch job)');
-  const summary2 = sent.filter(s => (s.text || '').includes('Job summary')).pop().text;
-  assert.ok(summary2.includes('🤖 nvidia / z-ai/glm-5.3'), 'confirm shows the switched current model');
-  upd(cb('confirm'));
-  await waitFor(() => allJobs().some(j => (j.inputText || '').includes('lighthouse')), 'post-switch job persisted');
-  const j2 = allJobs().find(j => (j.inputText || '').includes('lighthouse'));
-  assert.equal(j2.provider, 'nvidia', 'post-switch job carries the new provider');
-  assert.equal(j2.model, 'z-ai/glm-5.3', 'post-switch job carries the new model');
-  console.log('  ✓ a job started after /model uses the new selection (confirm line + persisted job)');
-} finally {
-  bot.kill('SIGKILL');
-  server.close();
-  // Clean the sandbox job folder the (expected-to-fail) test job created.
-  const sandbox = join(ROOT, 'core', 'sandbox');
-  if (existsSync(sandbox)) {
-    for (const d of readdirSync(sandbox)) {
-      if (d.includes('test-topic-about-rain') || d.includes('lighthouse-in-a-storm')) rmSync(join(sandbox, d), { recursive: true, force: true });
+// (f) first-turn TPM → switch + persistent notice + retry succeeds.
+test('(f) first-turn TPM switches provider with a persistent notice and retries', async () => {
+  snapshotRealState();
+  let groqPrompts = 0;
+  const h = await bootBot({
+    ocBehavior: {
+      onPrompt: ({ body }) => {
+        if (body.model.providerID === 'groq') { groqPrompts += 1; return { error: { status: 429, message: 'Rate limit reached for model openai/gpt-oss-120b: tokens per minute (TPM) limit 8000' } }; }
+        return null;
+      },
+      replyFor: () => 'Switched and done.',
+    },
+  });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('make a video about rivers');
+    const retry = await waitFor(() => h.oc.state.prompts.find(p => p.body.model.providerID === 'nvidia'), 'retry on nvidia');
+    assert(retry.body.parts[0].text.includes('standing model was switched to nvidia'), 'retry carries the switch note');
+    assert(retry.body.parts[0].text.includes('rivers'), 'retry carries the original request');
+    assert(groqPrompts === 1, 'exactly one failed groq attempt');
+    await waitFor(() => h.tg.texts().some(t => t.includes('⚠️') && t.includes('nvidia / nvidia/nemotron-3-super-120b-a12b')), 'persistent switch notice');
+    await waitFor(() => h.tg.texts().some(t => t.includes('Switched and done.')), 'retried reply delivered');
+    assert(readState()[OWNER].selection.model === 'nvidia/nemotron-3-super-120b-a12b', 'standing selection persisted as nvidia');
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+// (g) owner lock.
+test('(g) owner lock: strangers are ignored completely', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'should never happen' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.sayAs(9999, 'hello bot');
+    h.tg.sayAs(9999, '/start');
+    await sleep(1500);
+    assert(h.oc.state.prompts.length === 0, 'no prompt from a stranger');
+    assert(h.tg.sent().length === 0, 'no reply to a stranger');
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+// /start status in the conversational model.
+test('/start shows status (model + how to talk), not a form', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'x' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('/start');
+    const msg = await waitFor(() => h.tg.texts().find(t => t.includes("I'm awake")), 'status message');
+    assert(msg.includes('Current model: groq / openai/gpt-oss-120b'), 'status names the standing model');
+    assert(msg.includes('Just talk to me'), 'status explains the conversational way');
+    await sleep(500);
+    assert(h.oc.state.prompts.length === 0, '/start does not open a turn');
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+// Voice intake: transcribed and forwarded as a turn.
+test('voice message is saved, transcribed and forwarded as a turn', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'Got your voice script.' } });
+  const inboxDir = join(ROOT, 'data', 'inbox');
+  const before = new Set(existsSync(inboxDir) ? readdirSync(inboxDir) : []);
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.voice();
+    const prompt = await waitFor(() => h.oc.state.prompts[0], 'voice turn forwarded', 45000);
+    const text = prompt.body.parts.map(p => p.text || '').join('\n');
+    assert(text.includes('This is my recorded narration.'), `transcript forwarded (got: ${text.slice(0, 200)})`);
+    assert(text.includes('data/inbox/') && text.includes('voice script'), 'audio path + voice-script note forwarded');
+    const m = text.match(/data\/inbox\/\S+?voice\.ogg/);
+    assert(m && existsSync(join(ROOT, m[0])), 'audio file saved into data/inbox');
+  } finally {
+    await killBot(h); restoreRealState();
+    if (existsSync(inboxDir)) for (const f of readdirSync(inboxDir)) {
+      if (!before.has(f)) rmSync(join(inboxDir, f), { recursive: true, force: true });
     }
   }
-  rmSync(join(ROOT, 'data'), { recursive: true, force: true });
+});
+
+// Amendment A3: claim without delivery → one nudge turn.
+test('claim without delivery triggers exactly one nudge turn', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: {
+    onPrompt: ({ n }) => n === 1 ? { text: 'Done! I rendered final.mp4 and sent it to you.' } : { text: 'You are right — sending it now for real.' },
+    replyFor: () => 'unused',
+  } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('make the video');
+    const nudge = await waitFor(() => h.oc.state.prompts[1], 'nudge turn sent', 20000);
+    assert(nudge.body.parts[0].text.includes('nothing was sent to the chat'), 'nudge text is the system note');
+    await waitFor(() => h.tg.texts().some(t => t.includes('sending it now for real')), 'agent follow-up delivered');
+    await sleep(3500);
+    assert(h.oc.state.prompts.length === 2, `at most one nudge (prompts=${h.oc.state.prompts.length})`);
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+// (h) Session lifecycle: a final=true delivery rotates the session; the
+// next message opens a FRESH session whose first prompt carries the
+// memory brief (full preferences + last 10 index lines only).
+test('(h) final delivery rotates the session; next session opens with the memory brief', async () => {
+  snapshotRealState();
+  const indexLines = Array.from({ length: 12 }, (_, i) => `- 2026-10-${String(i + 1).padStart(2, '0')} — Video ${String(i + 1).padStart(2, '0')} — core/sandbox/v${String(i + 1).padStart(2, '0')}/`).join('\n') + '\n';
+  seedMemory('- Always 9:16.\n- Default style: line\n- He writes in Bengali mostly.\n', indexLines);
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'Working on it.' } });
+  const videoPath = join(ROOT, 'data', 'outbox', '.test-final.mp4');
+  const reqPath = join(ROOT, 'data', 'outbox', 'final-req.json');
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('make the rain video');
+    const p1 = await waitFor(() => h.oc.state.prompts[0], 'first prompt');
+    const sid1 = p1.sid;
+    const firstText = p1.body.parts.map(x => x.text || '').join('\n');
+    assert(firstText.includes('Your memory from previous sessions'), 'first session also briefed (memory was seeded)');
+    assert(firstText.includes('Always 9:16'), 'preferences in the brief');
+    // The agent delivers the FINISHED video: send_file with final=true.
+    writeFileSync(videoPath, Buffer.alloc(2048, 7));
+    writeFileSync(reqPath, JSON.stringify({ path: 'data/outbox/.test-final.mp4', caption: 'Rain — final', final: true }));
+    await waitFor(() => h.tg.calls.find(c => c.method === 'sendVideo'), 'final video sent');
+    await waitFor(() => (readState()[OWNER].pastSessions || []).length === 1, 'session archived into pastSessions');
+    assert(readState()[OWNER].pastSessions[0].id === sid1, 'the archived session is the one that delivered');
+    assert(!readState()[OWNER].sessionId, 'no live session after rotation');
+    // Next message → fresh session + memory brief.
+    h.tg.say('now make one about tea gardens');
+    const p2 = await waitFor(() => h.oc.state.prompts[1], 'second prompt');
+    assert(p2.sid !== sid1, 'fresh session after the final delivery');
+    const t2 = p2.body.parts.map(x => x.text || '').join('\n');
+    assert(t2.includes('Your memory from previous sessions — preferences and recent work'), 'memory brief intro present');
+    assert(t2.includes('Default style: line'), 'full preferences carried into the new session');
+    assert(t2.includes('Video 12') && t2.includes('Video 03'), 'recent index lines present');
+    assert(!t2.includes('Video 01') && !t2.includes('Video 02'), 'only the last 10 index lines are briefed');
+    assert(t2.includes('tea gardens'), 'the new request itself is in the prompt');
+  } finally {
+    await killBot(h); restoreRealState();
+    rmSync(videoPath, { force: true }); rmSync(reqPath, { force: true });
+    rmSync(join(ROOT, 'data', 'outbox', 'done', 'final-req.json'), { force: true });
+    rmSync(join(ROOT, 'data', 'outbox', 'done', 'final-req.result.json'), { force: true });
+  }
+});
+
+// (i) Without a final delivery, the session simply stays open.
+test('(i) without a final delivery, consecutive messages keep the same session', async () => {
+  snapshotRealState();
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'noted' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('first message of a job');
+    await waitFor(() => h.oc.state.prompts.length === 1, 'prompt 1');
+    await waitFor(() => h.tg.texts().some(t => t === 'noted'), 'reply 1');
+    h.tg.say('a revision to the same job');
+    const p2 = await waitFor(() => h.oc.state.prompts[1], 'prompt 2');
+    assert(p2.sid === h.oc.state.prompts[0].sid, 'same session across messages');
+    assert(!(readState()[OWNER].pastSessions || []).length, 'nothing archived');
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+// Migration: old-shape state file is tolerated, selection kept.
+test('old-shape state file is tolerated and its selection kept', async () => {
+  snapshotRealState();
+  writeFileSync(REAL_STATE, JSON.stringify({ [OWNER]: {
+    step: 'confirm', draft: { mode: 'topic' }, activeJobId: 'job-9', statusMsgId: 5,
+    selection: { provider: 'nvidia', model: 'z-ai/glm-5.3' },
+  } }));
+  const h = await bootBot({ ocBehavior: { replyFor: () => 'migration ok' } });
+  try {
+    await waitFor(() => h.child.log.includes('polling'), 'bot polling');
+    h.tg.say('hello after upgrade');
+    const prompt = await waitFor(() => h.oc.state.prompts[0], 'turn runs despite old state');
+    assert(prompt.body.model.providerID === 'nvidia' && prompt.body.model.modelID === 'z-ai/glm-5.3', 'old selection kept and used');
+    await waitFor(() => h.tg.texts().some(t => t.includes('migration ok')), 'reply delivered');
+  } finally { await killBot(h); restoreRealState(); }
+});
+
+let failed = 0;
+for (const t of tests) {
+  try { await t.fn(); console.log(`  ✓ ${t.name}`); }
+  catch (e) { failed += 1; console.log(`  ✗ ${t.name}\n      ${e.message}`); }
 }
+if (failed) throw new Error(`${failed} flow test(s) failed`);
+console.log(`flow: ${tests.length} conversation tests passed`);

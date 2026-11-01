@@ -15,14 +15,19 @@ export class Telegram {
     this.offset = 0;
   }
 
-  async call(method, params = {}) {
+  async call(method, params = {}, { timeoutMs = 0 } = {}) {
     const res = await fetch(`${this.base}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
+      ...(timeoutMs > 0 ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     });
     const json = await res.json().catch(() => null);
-    if (!json?.ok) throw new Error(`Telegram ${method} failed: ${JSON.stringify(json).slice(0, 300)}`);
+    if (!json?.ok) {
+      const err = new Error(`Telegram ${method} failed: ${JSON.stringify(json).slice(0, 300)}`);
+      err.telegram = json; // error_code / parameters.retry_after ride along for the poll loop
+      throw err;
+    }
     return json.result;
   }
 
@@ -46,6 +51,11 @@ export class Telegram {
   }
   sendMessage(chatId, text, replyMarkup) {
     return this.call('sendMessage', { chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) });
+  }
+  /** "typing…" indicator (lasts ~5 s per call — re-send while busy).
+      Best-effort by design: a failed indicator must never break a turn. */
+  sendChatAction(chatId, action = 'typing') {
+    return this.call('sendChatAction', { chat_id: chatId, action }).catch(() => {});
   }
   editMessageText(chatId, messageId, text, replyMarkup) {
     return this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) })
@@ -74,15 +84,41 @@ export class Telegram {
     return destPath;
   }
 
-  /** Long polling; handler(update) is awaited per update. */
+  /** Long polling; handler(update) is awaited per update.
+   *  Resilience contract: this loop NEVER dies. Network errors, timeouts,
+   *  409s (another poller on the same token) and 429s are logged and
+   *  retried with exponential backoff (3 s → 6 → 12 → 24 → 30 s cap,
+   *  honouring Telegram's retry_after when given); a successful poll
+   *  resets the backoff. The getUpdates fetch itself carries a client
+   *  timeout slightly longer than the long-poll window, so a hung
+   *  connection cannot stall the bot forever either. */
   async poll(handler, { timeoutSec = 50 } = {}) {
+    let backoffMs = 3000;
     for (;;) {
       let updates = [];
       try {
-        updates = await this.call('getUpdates', { offset: this.offset, timeout: timeoutSec, allowed_updates: ['message', 'callback_query'] });
+        updates = await this.call(
+          'getUpdates',
+          { offset: this.offset, timeout: timeoutSec, allowed_updates: ['message', 'callback_query'] },
+          { timeoutMs: (timeoutSec + 20) * 1000 },
+        );
+        // A malformed payload must retry with backoff like any other
+        // poll failure — never escape the loop and stop polling.
+        if (!Array.isArray(updates)) throw new Error('getUpdates returned a non-array result');
+        backoffMs = 3000; // healthy again
       } catch (e) {
-        console.error('[telegram] poll error:', e.message);
-        await new Promise(r => setTimeout(r, 3000));
+        const code = e.telegram?.error_code;
+        const retryAfter = e.telegram?.parameters?.retry_after;
+        if (code === 409) {
+          console.error('[telegram] poll: 409 Conflict — another program is polling this same bot token. Waiting and retrying (stop the other one if this keeps repeating).');
+        } else if (code === 429) {
+          console.error(`[telegram] poll: 429 Too Many Requests — backing off${retryAfter ? ` for ${retryAfter}s (Telegram's retry_after)` : ''}.`);
+        } else {
+          console.error('[telegram] poll error:', e.message);
+        }
+        const waitMs = retryAfter ? retryAfter * 1000 : backoffMs;
+        await new Promise(r => setTimeout(r, waitMs));
+        backoffMs = Math.min(backoffMs * 2, 30000);
         continue;
       }
       for (const u of updates) {
