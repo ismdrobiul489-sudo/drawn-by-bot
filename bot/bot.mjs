@@ -1,7 +1,10 @@
 // drawn-by-bot — Telegram front end.
 // Conversation flow (button-driven, state in data/state.json):
-//   /start → input mode → content → provider → model (live list) → style →
-//   aspect → voice (TTS modes) → confirm → queued job.
+//   /start → input mode → content → style → aspect → voice (TTS modes)
+//   → confirm → queued job.
+// Provider + model are NEVER asked in this flow: every job silently uses
+// the chat's saved current selection (initialised from .env). The only
+// place it can change is the owner's own /model command.
 // After a job's animatic arrives, free-text chat IS the feedback channel to
 // the same OpenCode session — exactly how the user talks to Claude.
 // While a job runs, the agent's permission requests and questions arrive
@@ -25,8 +28,24 @@ const STATE_FILE = join(ROOT, 'data', 'state.json');
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
 function saveState() { mkdirSync(join(ROOT, 'data'), { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
-const state = loadState(); // chatId -> { step, draft, models, voices, activeJobId, statusMsgId }
+const state = loadState(); // chatId -> { step, draft, models, voices, activeJobId, statusMsgId, selection, pickProvider }
 function chatState(id) { if (!state[id]) state[id] = { step: 'idle', draft: {} }; return state[id]; }
+
+// ── Current provider/model selection ────────────────────────────────────
+// The .env defaults ARE the standing selection: used silently by every
+// job, never asked about in the job flow. The owner changes it only by
+// running /model himself; the choice then persists here (per chat) until
+// he changes it again.
+function envDefaultSelection() {
+  const p = (env('DEFAULT_PROVIDER', 'groq') || 'groq').trim().toLowerCase();
+  const provider = PROVIDERS[p] ? p : 'groq';
+  return { provider, model: PROVIDERS[provider].defaultModel() };
+}
+function selectionOf(cs) {
+  const s = cs.selection;
+  if (!s || !PROVIDERS[s.provider] || !s.model) { cs.selection = envDefaultSelection(); }
+  return cs.selection;
+}
 
 const tg = new Telegram(env('TELEGRAM_BOT_TOKEN'));
 const relay = new AskRelay({ tg, agent: agentServer });
@@ -120,44 +139,49 @@ async function startMode(chatId, mode) {
     : mode === 'topic' ? '💡 Type your topic and send it (one line is enough).' : '📝 Type the full script and send it.');
 }
 
-async function stepProvider(chatId) {
+// ── /model — the ONLY place the current selection can change ───────────────
+// Entered exclusively via the owner's /model command; nothing else routes
+// here — no step of the job flow, no confirm screen, no notice. Shows the
+// current selection, provider buttons (current first + ⭐), then that
+// provider's LIVE model list (the same listModels fetch + paging the old
+// per-job step used). Tapping a model SAVES it as the current selection.
+async function stepModelPicker(chatId) {
   const cs = chatState(chatId);
-  cs.step = 'provider'; saveState();
-  // DEFAULT_PROVIDER from .env (any letter case) is shown first, starred.
-  const def = (env('DEFAULT_PROVIDER', 'groq') || 'groq').trim().toLowerCase();
+  cs.step = 'pick-provider'; cs.draft = {}; saveState();
+  const sel = selectionOf(cs);
   const opts = [
-    { text: '⚡ Groq', data: 'prov:groq', key: 'groq' },
-    { text: '🟢 NVIDIA', data: 'prov:nvidia', key: 'nvidia' },
+    { text: '⚡ Groq', data: 'mprov:groq', key: 'groq' },
+    { text: '🟢 NVIDIA', data: 'mprov:nvidia', key: 'nvidia' },
   ];
-  opts.sort((a, b) => (a.key === def ? -1 : b.key === def ? 1 : 0));
-  const row = opts.map(({ text, data, key }) => ({ text: key === def ? `${text} ⭐` : text, data }));
-  await tg.sendMessage(chatId, 'Which provider should run this job?', keyboard([row]));
+  opts.sort((a, b) => (a.key === sel.provider ? -1 : b.key === sel.provider ? 1 : 0));
+  const row = opts.map(({ text, data, key }) => ({ text: key === sel.provider ? `${text} ⭐` : text, data }));
+  await tg.sendMessage(chatId, `🤖 Current model: ${sel.provider} / ${sel.model}\n\nPick a provider to see its models — tapping a model makes it the current one for all new jobs.`, keyboard([row]));
 }
 
-async function stepModel(chatId, { refresh = false, page = 0 } = {}) {
+async function stepModelList(chatId, { refresh = false, page = 0 } = {}) {
   const cs = chatState(chatId);
-  const provider = cs.draft.provider;
+  const provider = cs.pickProvider;
+  const sel = selectionOf(cs);
   await tg.sendMessage(chatId, `⏳ Fetching the live model list from ${PROVIDERS[provider].label}…`);
   let models;
   try {
     ({ models } = await listModels(provider, { refresh }));
   } catch (e) {
-    await tg.sendMessage(chatId, `❌ ${e.message}`, keyboard([[{ text: '🔄 Try again', data: 'models:refresh' }, { text: '⬅️ Change provider', data: 'back:provider' }]]));
+    await tg.sendMessage(chatId, `❌ ${e.message}`, keyboard([[{ text: '🔄 Try again', data: 'mmodels:refresh' }, { text: '⬅️ Change provider', data: 'mpick' }]]));
     return;
   }
-  cs.models = models; cs.step = 'model'; saveState();
+  cs.models = models; cs.step = 'pick-model'; saveState();
   const per = 10;
   const pages = Math.max(1, Math.ceil(models.length / per));
   const slice = models.slice(page * per, page * per + per);
-  const def = PROVIDERS[provider].defaultModel();
-  const btns = slice.map((m, i) => ({ text: (m === def ? '⭐ ' : '') + m.split('/').pop(), data: `model:${page * per + i}` }));
+  const btns = slice.map((m, i) => ({ text: (provider === sel.provider && m === sel.model ? '⭐ ' : '') + m.split('/').pop(), data: `mmodel:${page * per + i}` }));
   const rows = rowsOf(btns, 1);
   const nav = [];
-  if (page > 0) nav.push({ text: '⬅️ Previous', data: `models:page:${page - 1}` });
-  if (page < pages - 1) nav.push({ text: 'Next ➡️', data: `models:page:${page + 1}` });
+  if (page > 0) nav.push({ text: '⬅️ Previous', data: `mmodels:page:${page - 1}` });
+  if (page < pages - 1) nav.push({ text: 'Next ➡️', data: `mmodels:page:${page + 1}` });
   if (nav.length) rows.push(nav);
-  rows.push([{ text: '🔄 Refresh list', data: 'models:refresh' }, { text: '⬅️ Provider', data: 'back:provider' }]);
-  await tg.sendMessage(chatId, `Select a model (${PROVIDERS[provider].label} — ${models.length} chat models available):`, keyboard(rows));
+  rows.push([{ text: '🔄 Refresh list', data: 'mmodels:refresh' }, { text: '⬅️ Provider', data: 'mpick' }]);
+  await tg.sendMessage(chatId, `Select a model (${PROVIDERS[provider].label} — ${models.length} chat models available). It becomes the current model for all new jobs:`, keyboard(rows));
 }
 
 async function stepStyle(chatId) {
@@ -199,11 +223,14 @@ async function stepConfirm(chatId) {
   const cs = chatState(chatId);
   cs.step = 'confirm'; saveState();
   const d = cs.draft;
+  const sel = selectionOf(cs);
   const text = [
     '📋 Job summary:',
     `• Mode: ${d.mode}`,
     `• Input: ${d.mode === 'voice' ? '🎙️ audio file' : String(d.inputText || '').slice(0, 120)}`,
-    `• Provider/Model: ${d.provider} / ${d.model}`,
+    // Informational ONLY — the current selection, shown so it is never
+    // hidden. No button, no question: changing it lives solely in /model.
+    `• 🤖 ${sel.provider} / ${sel.model} (change anytime with /model)`,
     `• Style: ${d.style}   • Aspect: ${d.aspect}`,
     ...(d.mode !== 'voice' ? [`• Voice: ${d.voice}`] : []),
     '',
@@ -218,7 +245,10 @@ async function stepConfirm(chatId) {
 async function enqueue(chatId) {
   const cs = chatState(chatId);
   const d = cs.draft;
-  const job = queue.enqueue({ chatId, ...d, finalNow: false });
+  // The job takes provider/model from the saved current selection — the
+  // setup draft never carries them any more.
+  const sel = selectionOf(cs);
+  const job = queue.enqueue({ chatId, ...d, provider: sel.provider, model: sel.model, finalNow: false });
   cs.activeJobId = job.id; cs.step = 'working'; cs.draft = {}; saveState();
   const pos = queue.position(job.id);
   await tg.sendMessage(chatId, pos >= 0
@@ -240,14 +270,18 @@ async function onCallback(q) {
 
   if (data === 'new') { cs.activeJobId = null; await stepMode(chatId); return; }
   if (data.startsWith('mode:')) { await startMode(chatId, data.slice(5)); return; }
-  if (data === 'back:provider') { await stepProvider(chatId); return; }
-  if (data.startsWith('prov:')) { cs.draft.provider = data.slice(5); saveState(); await stepModel(chatId); return; }
-  if (data === 'models:refresh') { await stepModel(chatId, { refresh: true }); return; }
-  if (data.startsWith('models:page:')) { await stepModel(chatId, { page: Number(data.split(':')[2]) || 0 }); return; }
-  if (data.startsWith('model:')) {
-    const m = (cs.models || [])[Number(data.slice(6))];
-    if (!m) { await tg.sendMessage(chatId, '⚠️ The model list is stale — fetching it again.'); await stepModel(chatId, { refresh: true }); return; }
-    cs.draft.model = m; saveState(); await stepStyle(chatId); return;
+  // /model picker callbacks — only reachable inside a /model session the
+  // owner started himself with the /model command.
+  if (data === 'mpick') { await stepModelPicker(chatId); return; }
+  if (data.startsWith('mprov:')) { cs.pickProvider = data.slice(6); saveState(); await stepModelList(chatId); return; }
+  if (data === 'mmodels:refresh') { await stepModelList(chatId, { refresh: true }); return; }
+  if (data.startsWith('mmodels:page:')) { await stepModelList(chatId, { page: Number(data.split(':')[2]) || 0 }); return; }
+  if (data.startsWith('mmodel:')) {
+    const m = (cs.models || [])[Number(data.slice(7))];
+    if (!m) { await tg.sendMessage(chatId, '⚠️ The model list is stale — fetching it again.'); await stepModelList(chatId, { refresh: true }); return; }
+    cs.selection = { provider: cs.pickProvider, model: m }; cs.step = 'idle'; saveState();
+    await tg.sendMessage(chatId, `✅ Current model set to ${cs.pickProvider} / ${m} — all new jobs will use it until you change it with /model.`);
+    return;
   }
   if (data.startsWith('style:')) {
     cs.draft.style = data.slice(6); saveState();
@@ -289,6 +323,10 @@ async function onMessage(msg) {
   const modeCmd = { '/topic': 'topic', '/script': 'script', '/voice': 'voice' }[text];
   if (modeCmd) { cs.activeJobId = null; await startMode(chatId, modeCmd); return; }
 
+  // /model — the ONLY way the current provider/model selection changes,
+  // and only when the owner explicitly runs it. Nothing else routes here.
+  if (text === '/model') { await stepModelPicker(chatId); return; }
+
   if (text === '/cancel') {
     // Cancels only the in-progress SETUP (draft + step). A running or
     // animatic-stage job is NOT touched, and neither are pending
@@ -312,7 +350,9 @@ async function onMessage(msg) {
       '• 📝 Script — you type the full script; it is narrated as-is.',
       '• 🎙️ Voice script — you record the full narration yourself and send it as a voice message or audio file. The video is built from your voice: Whisper transcribes it (the transcript IS the script), scenes are timed to it, and your own audio stays as the narration. No script writing, no TTS.',
       '',
-      'Everything after that is buttons too: style, aspect, voice. Provider (Groq / NVIDIA) and model are picked per job from the live list of your API key — the ⭐ default comes from .env, and you can switch any job.',
+      'Everything after that is buttons too: style, aspect, voice.',
+      '',
+      `Every job runs on your current model — right now ${selectionOf(cs).provider} / ${selectionOf(cs).model}. Jobs never ask about provider or model; /model changes the current model.`,
       '',
       'While a job runs, the video agent may need permission or a decision — that arrives here as a message with buttons; just tap an answer. Nothing is ever auto-approved.',
       '',
@@ -320,7 +360,7 @@ async function onMessage(msg) {
       '',
       'Shortcuts: /topic, /script and /voice jump straight into that mode — no menu, and no doubt about whether your text is a topic or a script.',
       '',
-      'Commands: /start — begin • /new — new job • /topic /script /voice — jump straight into a mode • /cancel — cancel the current setup • /help — this text',
+      'Commands: /start — begin • /new — new job • /topic /script /voice — jump straight into a mode • /model — change the current model • /cancel — cancel the current setup • /help — this text',
     ].join('\n'));
     return;
   }
@@ -334,12 +374,12 @@ async function onMessage(msg) {
       const dest = join(ROOT, 'data', 'uploads', `${chatId}-${Date.now()}${ext}`);
       await tg.download(att.file_id, dest);
       cs.draft.inputAudioPath = dest; cs.draft.inputAudioExt = ext; saveState();
-      await stepProvider(chatId);
+      await stepStyle(chatId);
       return;
     }
     if (!text) { await tg.sendMessage(chatId, '✍️ Please type it and send.'); return; }
     cs.draft.inputText = text; saveState();
-    await stepProvider(chatId);
+    await stepStyle(chatId);
     return;
   }
 
@@ -385,6 +425,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     { command: 'topic', description: 'New video from a topic' },
     { command: 'script', description: 'New video from your script' },
     { command: 'voice', description: 'Make a video from your voice script' },
+    { command: 'model', description: 'Change the current model' },
     { command: 'cancel', description: 'Cancel the current setup' },
     { command: 'help', description: 'How this bot works' },
   ]);

@@ -13,9 +13,11 @@ It is built around three pieces:
 - **OpenCode** — the agentic framework that sits where Claude Code sat in the
   original workflow. It follows the repo's own process (brief → style test →
   animatic → review → final) and the project's own instructions
-  (`AGENTS.md`, `.opencode/agent/video-maker.md`), powered by the user's
-  choice of **Groq** or **NVIDIA** models — selected per job, with the model
-  list fetched live from the provider (never hardcoded).
+  (`AGENTS.md`, `.opencode/agent/video-maker.md`), powered by **Groq** or
+  **NVIDIA** models. A standing current selection (starting from the
+  `.env` defaults) runs every job — jobs never ask about provider or
+  model; the selection changes only when the owner runs `/model`, which
+  picks from the provider's live model list (never hardcoded).
 - **`bot/` + `media/`** — our own code: the Telegram conversation, the job
   queue and processor, and the media tools (Edge TTS, Groq Whisper → SRT,
   NVIDIA vision QC, delivery encoding, public-link store).
@@ -24,9 +26,9 @@ It is built around three pieces:
 
 ```
 /start → [💡 Topic | 📝 Script | 🎙️ Voice] → send content
-       → Provider [Groq | NVIDIA] → Model (live list from that API key)
        → Style (from core/styles/) → Aspect [9:16 | 16:9]
        → Voice (live Edge TTS list, when narration is needed) → Confirm
+       (the confirm card shows the current model as an info line)
 ```
 
 - **Topic** → the agent writes the script, Edge TTS narrates it, the scene
@@ -37,6 +39,14 @@ It is built around three pieces:
 
 Or skip the menu: the commands `/topic`, `/script` and `/voice` jump
 straight into that mode with a fresh draft.
+
+Provider/model are not part of the flow at all: every job silently uses
+the **current model**, which starts as the `.env` defaults
+(`DEFAULT_PROVIDER` + that provider's `*_DEFAULT_MODEL`). `/model` is
+the only place it ever changes — it shows the current selection and
+lets you pick another model from the provider's live list; the new
+selection then persists for all following jobs until you change it
+again.
 
 One job runs at a time (FIFO queue). The agent renders a low-res **animatic
 first** and sends it to the chat — you reply in plain language ("make the
@@ -50,8 +60,8 @@ when needed). No duration limit: long videos are chunked underneath
 delivered by store link when they outgrow Telegram.
 
 **Dead models never fail silently.** The values in `.env` are the
-defaults (the ⭐ provider/model in the bot's steps); the model list
-itself stays dynamic, fetched live from your API key. But a listed model
+starting selection (changeable later only via `/model`, which fetches
+the live list from your API key). But a listed model
 can still be dead when called — so before a job starts, the chosen model
 is verified with a 1-token API probe. If it doesn't answer, the job
 automatically falls back to that provider's `.env` default, then to the
@@ -196,7 +206,7 @@ npm start       # run the bot (needs a filled .env)
    has it controls the bot.
 5. Run the bot once (`bash run.sh` below) and it registers its own
    command menu — `/start`, `/new`, `/topic`, `/script`, `/voice`,
-   `/cancel`, `/help` — with Telegram automatically. BotFather's
+   `/model`, `/cancel`, `/help` — with Telegram automatically. BotFather's
    `/setcommands` is **not** needed.
 
 ```bash
