@@ -271,6 +271,40 @@ async function onMessage(msg) {
 
   if (text === '/start' || text === '/new') { cs.activeJobId = null; await stepMode(chatId); return; }
 
+  if (text === '/cancel') {
+    // Cancels only the in-progress SETUP (draft + step). A running or
+    // animatic-stage job is NOT touched, and neither are pending
+    // permission/question asks — those belong to the job, not the setup.
+    const job = cs.activeJobId ? queue.get(cs.activeJobId) : null;
+    cs.draft = {}; cs.step = 'idle'; saveState();
+    let reply = "Setup cancelled. Send /start whenever you're ready.";
+    if (job && job.stage === 'awaiting-feedback') {
+      reply += `\nYour job ${job.id} is untouched — its buttons still work, and you can still just reply with feedback.`;
+    }
+    await tg.sendMessage(chatId, reply);
+    return;
+  }
+
+  if (text === '/help') {
+    await tg.sendMessage(chatId, [
+      '🎬 How this bot works',
+      '',
+      'Press /start, say what you will give, then follow the buttons:',
+      '• 💡 Topic — you type a topic; the script and the narration voice are made for you.',
+      '• 📝 Script — you type the full script; it is narrated as-is.',
+      '• 🎙️ Voice — you send a voice note or audio file; Whisper transcribes it into a transcript + SRT subtitles, and the video is built on its timing.',
+      '',
+      'Everything after that is buttons too: style, aspect, voice. Provider (Groq / NVIDIA) and model are picked per job from the live list of your API key — the ⭐ default comes from .env, and you can switch any job.',
+      '',
+      'While a job runs, the video agent may need permission or a decision — that arrives here as a message with buttons; just tap an answer. Nothing is ever auto-approved.',
+      '',
+      'Once the preview (animatic) arrives, any plain-text reply is feedback: it goes to the same agent session, which revises and sends a new preview. Press ✅ Final render when you are happy.',
+      '',
+      'Commands: /start — begin • /new — new job • /cancel — cancel the current setup • /help — this text',
+    ].join('\n'));
+    return;
+  }
+
   if (cs.step === 'content') {
     if (cs.draft.mode === 'voice') {
       const att = msg.voice || msg.audio || (msg.document?.mime_type?.startsWith('audio') ? msg.document : null);
@@ -323,6 +357,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (removed) console.log(`[store] rotated ${removed} old job(s)`);
   relay.start();
   await relay.resendPending(); // re-show any ask a restart interrupted
+  // Register the "/" command menu with Telegram itself, so the owner
+  // never has to configure it in BotFather. Non-fatal if it fails.
+  await tg.setMyCommands([
+    { command: 'start', description: 'Start the video maker' },
+    { command: 'new', description: 'Start a new video job' },
+    { command: 'cancel', description: 'Cancel the current setup' },
+    { command: 'help', description: 'How this bot works' },
+  ]);
   console.log('[bot] polling… (owner-only)');
   await tg.poll(async u => {
     if (u.callback_query) await onCallback(u.callback_query);

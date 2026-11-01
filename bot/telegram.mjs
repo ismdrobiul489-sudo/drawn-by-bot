@@ -37,6 +37,13 @@ export class Telegram {
     return json.result;
   }
 
+  /** Register the "/" command menu shown by Telegram clients.
+      Non-fatal by design: a failure here is logged, never thrown — a
+      missing menu must not stop the bot. */
+  setMyCommands(commands) {
+    return this.call('setMyCommands', { commands })
+      .catch(e => console.warn('[telegram] setMyCommands failed (command menu not set):', e.message));
+  }
   sendMessage(chatId, text, replyMarkup) {
     return this.call('sendMessage', { chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) });
   }

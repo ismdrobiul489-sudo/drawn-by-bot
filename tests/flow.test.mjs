@@ -11,6 +11,7 @@ import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
 const sent = [];
+const calls = []; // every JSON API call the bot makes: { method, params }
 let pending = [];
 let updateId = 0;
 const upd = u => { pending.push({ update_id: ++updateId, ...u }); };
@@ -33,6 +34,7 @@ const server = createServer((req, res) => {
     const method = url.split('/').pop();
     let params = {};
     try { params = JSON.parse(body || '{}'); } catch { /* multipart */ }
+    calls.push({ method, params });
     if (method === 'getUpdates') {
       const out = pending; pending = [];
       res.end(JSON.stringify({ ok: true, result: out }));
@@ -76,6 +78,17 @@ try {
   await waitFor(hasText('What will you give'), 'mode keyboard');
   assert.ok(JSON.stringify(lastKb('What will you give')).includes('mode:topic'));
 
+  // (a) The bot registered its command menu with Telegram at boot.
+  const sc = calls.find(c => c.method === 'setMyCommands');
+  assert.ok(sc, 'setMyCommands was called at boot');
+  assert.deepEqual(sc.params.commands, [
+    { command: 'start', description: 'Start the video maker' },
+    { command: 'new', description: 'Start a new video job' },
+    { command: 'cancel', description: 'Cancel the current setup' },
+    { command: 'help', description: 'How this bot works' },
+  ]);
+  console.log('  ✓ setMyCommands registered the 4-command menu at boot');
+
   // A stranger is ignored:
   pending.push({ update_id: ++updateId, message: { message_id: 1, chat: { id: 99 }, from: { id: 99 }, text: '/start' } });
   await sleep(600);
@@ -108,6 +121,31 @@ try {
   await waitFor(hasText('queue'), 'queued message');
   console.log('  ✓ flow: /start → mode → content → provider → live models → style → aspect → voice → confirm → queue');
   console.log('  ✓ owner-only lock verified (stranger ignored)');
+
+  // (b) /help returns the explainer.
+  upd(msg('/help'));
+  await waitFor(hasText('How this bot works'), 'help text');
+  const helpText = sent.filter(s => (s.text || '').includes('How this bot works')).pop().text;
+  assert.ok(helpText.includes('Topic') && helpText.includes('Script') && helpText.includes('Voice'), 'help names the 3 modes');
+  assert.ok(helpText.includes('buttons'), 'help says everything runs by buttons');
+  assert.ok(helpText.includes('feedback'), 'help explains plain-text feedback');
+  console.log('  ✓ /help returns the explainer');
+
+  // (c) /cancel mid-setup clears the draft/step: start a script setup,
+  // cancel at the content step, then plain text must NOT be taken as the
+  // script (it would advance to the provider step) — it hits the fallback.
+  const countText = frag => sent.filter(s => (s.text || '').includes(frag)).length;
+  const modesBefore = countText('What will you give');
+  upd(msg('/start'));
+  await waitFor(() => countText('What will you give') > modesBefore, 'mode keyboard again');
+  upd(cb('mode:script'));
+  await waitFor(hasText('Type the full script'), 'script content prompt');
+  upd(msg('/cancel'));
+  await waitFor(hasText('Setup cancelled'), 'cancel reply');
+  upd(msg('this text must not become a script'));
+  await waitFor(hasText('Press /start to begin a new video.'), 'fallback after cancel — old step is gone');
+  assert.ok(!hasText('Which provider')() || countText('Which provider') === 1, 'cancelled setup did not advance to provider step');
+  console.log('  ✓ /cancel mid-setup clears state (plain text no longer continues the old step)');
 } finally {
   bot.kill('SIGKILL');
   server.close();

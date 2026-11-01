@@ -183,6 +183,18 @@ npm start       # run the bot (needs a filled .env)
 
 ## Deploy (VPS) — the whole thing is three commands
 
+### Create the Telegram bot (once)
+
+1. In Telegram, open **@BotFather** and send `/newbot`.
+2. Choose a **display name** (anything you like, e.g. "Drawn Videos").
+3. Choose a **username** — it must end in `bot` (e.g. `my_drawn_videos_bot`).
+4. BotFather replies with a **token**. Paste it when `setup-env.sh` asks
+   for the bot token — **never share the token in a chat**: anyone who
+   has it controls the bot.
+5. Run the bot once (`bash run.sh` below) and it registers its own
+   command menu — `/start`, `/new`, `/cancel`, `/help` — with Telegram
+   automatically. BotFather's `/setcommands` is **not** needed.
+
 ```bash
 git clone https://github.com/ismdrobiul489-sudo/drawn-by-bot.git
 cd drawn-by-bot
