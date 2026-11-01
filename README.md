@@ -36,14 +36,45 @@ It is built around three pieces:
   on its own), then the scene is built on its timing with your own audio.
 
 One job runs at a time (FIFO queue). The agent renders a low-res **animatic
-first** and sends it to the chat — you reply in plain language ("রংটা বদলাও",
-"এই জায়গাটা ফাঁকা"), the bot forwards your words into the **same OpenCode
-session**, and it revises. When you're happy you press **✅ Final render**.
+first** and sends it to the chat — you reply in plain language ("make the
+sky warmer", "this part feels empty"), the bot forwards your words into
+the **same OpenCode session**, and it revises. When you're happy you
+press **✅ Final render**.
 The finished master is stored and its **public backup link** travels with
 the Telegram video (which is bitrate-capped to fit Telegram's bot limit
 when needed). No duration limit: long videos are chunked underneath
 (TTS by sentence, Whisper by 10-minute chunks, scenes by SRT segment) and
 delivered by store link when they outgrow Telegram.
+
+## Permissions & questions — answered with buttons, never typing
+
+The agent runs on a long-lived `opencode serve` process (the `serve`
+driver). Routine in-project work — running the engine, editing files
+inside the job folder — is pre-approved in `opencode.json` and **never
+asks you anything**. Only something outside that pattern (for example a
+command the safety rules flag, or an agent loop) stops and asks:
+
+- **Permission request** — you get a Telegram message saying in plain
+  English what the agent wants to do (the tool, and the command or file
+  it touches), with three buttons:
+  - **✅ Yes** — allow this one time only
+  - **♾️ Always for this job** — allow it for the rest of this session
+  - **❌ No** — deny it; the agent works around it or reports back
+- **Question** — when the agent needs a decision, you get the question
+  as a message with **one button per option**. If a question has no
+  options, just reply with a text message; your reply is the answer.
+
+The job is **paused** while an ask is open (OpenCode itself waits), and
+**nothing is ever auto-approved**: if you don't answer, the job simply
+waits. After 30 minutes you get one reminder nudge. Pending asks are
+saved to `data/pending.json`, so if the bot restarts mid-job the same
+ask is re-sent when it comes back — it can never silently vanish.
+Permissions outside the project folder are denied outright in
+`opencode.json`, so they never even reach you.
+
+Set `OPENCODE_DRIVER=run` in `.env` to fall back to the old one-shot
+`opencode run` driver (used automatically if the server cannot start);
+that driver has no button relay.
 
 ## Repo layout
 
@@ -51,7 +82,9 @@ delivered by store link when they outgrow Telegram.
 core/                  upstream drawn-by-code, UNMODIFIED (see UPSTREAM.md)
 bot/                   Telegram bot: telegram.mjs (API client), bot.mjs (flow),
                        models.mjs (dynamic model lists), styles.mjs, queue.mjs
-                       (one active job), processor.mjs (OpenCode driver)
+                       (one active job), processor.mjs (job pipeline),
+                       agent-server.mjs (opencode serve driver),
+                       relay.mjs (permission/question → Telegram buttons)
 media/                 tts.mjs (Edge TTS), whisper.mjs (Groq Whisper → SRT),
                        srt.mjs, qc-vision.mjs (NVIDIA vision QC),
                        encode.mjs (Telegram fit), store.mjs (public links)
@@ -96,6 +129,11 @@ these paths are written and unit/flow-tested but not live-fired:
 - OpenCode actually driving a job end-to-end with a real Groq/NVIDIA key
   (OpenCode 1.19.5 itself was installed and its provider config verified
   here: `opencode models` lists both providers; sessions need keys).
+  The serve driver's HTTP/SSE endpoints were verified live against the
+  installed 1.19.5 server's own OpenAPI doc, and the permission/question
+  relay is tested against a mock server implementing those exact shapes —
+  but a real agent hitting a real permission prompt mid-job is still
+  untested until the first live job on the VPS.
 - Edge TTS synthesis from this machine (its network blocks the endpoint —
   a known, documented issue; test on the VPS per the checklist).
 - Groq Whisper calls from this code (the same account/endpoint was verified

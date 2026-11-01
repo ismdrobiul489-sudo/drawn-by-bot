@@ -73,8 +73,8 @@ const lastKb = frag => sent.filter(s => (s.text || '').includes(frag)).pop()?.re
 
 try {
   upd(msg('/start'));
-  await waitFor(hasText('কী দেবেন?'), 'mode keyboard');
-  assert.ok(JSON.stringify(lastKb('কী দেবেন?')).includes('mode:topic'));
+  await waitFor(hasText('What will you give'), 'mode keyboard');
+  assert.ok(JSON.stringify(lastKb('What will you give')).includes('mode:topic'));
 
   // A stranger is ignored:
   pending.push({ update_id: ++updateId, message: { message_id: 1, chat: { id: 99 }, from: { id: 99 }, text: '/start' } });
@@ -82,23 +82,23 @@ try {
   assert.ok(!sent.some(s => s.chat_id === 99), 'stranger must be ignored');
 
   upd(cb('mode:topic'));
-  await waitFor(hasText('Topic লিখে পাঠান'), 'topic prompt');
+  await waitFor(hasText('Type your topic'), 'topic prompt');
   upd(msg('test topic about rain'));
-  await waitFor(hasText('কোন provider'), 'provider keyboard');
+  await waitFor(hasText('Which provider'), 'provider keyboard');
   upd(cb('prov:groq'));
-  await waitFor(hasText('Model সিলেক্ট করুন'), 'model list');
-  const modelKb = JSON.stringify(lastKb('Model সিলেক্ট করুন'));
+  await waitFor(hasText('Select a model'), 'model list');
+  const modelKb = JSON.stringify(lastKb('Select a model'));
   assert.ok(modelKb.includes('gpt-oss-120b'), 'dynamic model button present');
   assert.ok(!modelKb.includes('whisper'), 'whisper filtered out of chat models');
 
   upd(cb('model:0'));
-  await waitFor(hasText('Style সিলেক্ট করুন'), 'style list');
-  assert.ok(JSON.stringify(lastKb('Style সিলেক্ট করুন')).includes('style:line'));
+  await waitFor(hasText('Select a style'), 'style list');
+  assert.ok(JSON.stringify(lastKb('Select a style')).includes('style:line'));
 
   upd(cb('style:line'));
   await waitFor(hasText('Aspect ratio'), 'aspect');
   upd(cb('aspect:9:16'));
-  await waitFor(hasText('কোন কণ্ঠে'), 'voice list (fallback ok)');
+  await waitFor(hasText('Which voice'), 'voice list (fallback ok)');
   upd(cb('voice:0'));
   await waitFor(hasText('Job summary'), 'confirm card');
   const summary = sent.filter(s => (s.text || '').includes('Job summary')).pop().text;

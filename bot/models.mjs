@@ -43,7 +43,7 @@ export async function listModels(provider, { refresh = false } = {}) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`Unknown provider "${provider}"`);
   const key = p.key();
-  if (!key) throw new Error(`${p.label} API key .env-তে নেই — আগে key বসান।`);
+  if (!key) throw new Error(`${p.label} API key is missing in .env — add the key first.`);
   const ttl = envInt('MODELS_CACHE_TTL_SEC', 900) * 1000;
   const hit = cache.get(provider);
   if (!refresh && hit && Date.now() - hit.at < ttl) return { models: hit.models, cached: true };

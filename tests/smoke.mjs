@@ -75,4 +75,12 @@ const code = await new Promise(resolve => {
 });
 assert.equal(code, 0, 'flow test failed');
 passed++;
+
+console.log('— Permission/question relay (child process, mock OpenCode server) —');
+const relayCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/relay.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(relayCode, 0, 'relay test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

@@ -2,13 +2,21 @@
 // progress relay → animatic feedback loop → final render → vision QC →
 // store + Telegram delivery. The upstream engine and kits are used exactly
 // as they are; everything here is a wrapper around them.
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+//
+// Two drivers, picked by OPENCODE_DRIVER in .env:
+//   serve (default) — one long-lived `opencode serve` process; turns are
+//     prompts into a per-job session, and the agent's permission/question
+//     asks are relayed to Telegram as buttons (bot/relay.mjs).
+//   run — the original `opencode run --format json` one-shot driver, kept
+//     as a fallback if the server cannot start (no button relay there).
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { env, envInt, ROOT } from '../lib/env.mjs';
 import { binaryExists, runStreaming } from '../lib/run.mjs';
 import { fitForTelegram, MB } from '../media/encode.mjs';
 import { storeFile } from '../media/store.mjs';
 import { qcContactSheet } from '../media/qc-vision.mjs';
+import { agentServer } from './agent-server.mjs';
 
 const CORE = join(ROOT, 'core');
 
@@ -48,16 +56,40 @@ function opencodeModel(job) {
   return `${job.provider}/${job.model}`;
 }
 
-/**
- * Run one OpenCode message for a job (first run or a feedback follow-up).
- * Streams progress lines to onProgress (throttled by the caller).
- * Returns { sessionId }.
- */
-export function runOpenCode(job, message, { onProgress } = {}) {
+/** Which OpenCode driver is active: "serve" (default) or "run" (fallback). */
+export function openCodeDriver() {
+  return env('OPENCODE_DRIVER', 'serve').toLowerCase() === 'run' ? 'run' : 'serve';
+}
+
+// ── serve driver (agent-server.mjs) ─────────────────────────────────────────
+
+async function runOpenCodeServe(job, message, { onProgress, relay } = {}) {
+  await agentServer.ensure();
+  if (!job.sessionId) {
+    job.sessionId = await agentServer.createSession({
+      providerID: job.provider, modelID: job.model, title: job.id,
+    });
+  }
+  // Route this session's permission/question asks to the owner's chat.
+  relay?.attach(job.sessionId, job.chatId, job.id);
+  agentServer.setProgress(job.sessionId, onProgress);
+  try {
+    await agentServer.prompt(job.sessionId, message, {
+      providerID: job.provider, modelID: job.model,
+    });
+  } finally {
+    agentServer.setProgress(job.sessionId, null);
+  }
+  return { sessionId: job.sessionId };
+}
+
+// ── run driver (fallback: `opencode run --format json`, one process/turn) ──
+
+export function runOpenCodeRun(job, message, { onProgress } = {}) {
   return new Promise((resolve, reject) => {
     const bin = env('OPENCODE_BIN', 'opencode');
     if (!binaryExists(bin)) {
-      reject(new Error(`OpenCode binary "${bin}" পাওয়া যায়নি — VPS-এ deploy/setup.sh চালিয়ে install করুন, বা .env-তে OPENCODE_BIN ঠিক করুন।`));
+      reject(new Error(`OpenCode binary "${bin}" not found — run deploy/setup.sh on the VPS, or fix OPENCODE_BIN in .env.`));
       return;
     }
     const args = ['run', '--format', 'json', '--model', opencodeModel(job)];
@@ -80,9 +112,27 @@ export function runOpenCode(job, message, { onProgress } = {}) {
     done.then(code => {
       clearTimeout(timer);
       if (code === 0) resolve({ sessionId: job.sessionId });
-      else reject(new Error(`OpenCode run শেষ হয়েছে code ${code} দিয়ে।`));
+      else reject(new Error(`OpenCode run finished with code ${code}.`));
     }, err => { clearTimeout(timer); reject(err); });
   });
+}
+
+/**
+ * Run one OpenCode message for a job (first run or a feedback follow-up).
+ * hooks may carry { onProgress, relay } — the relay wires the session's
+ * permission/question asks to Telegram buttons (serve driver only).
+ */
+export async function runOpenCode(job, message, hooks = {}) {
+  if (openCodeDriver() === 'run') return runOpenCodeRun(job, message, hooks);
+  try {
+    await agentServer.ensure();
+  } catch (e) {
+    // ONLY a server that cannot start falls back to the one-shot driver —
+    // a turn that already ran must never be silently re-run by `run`.
+    console.error(`[processor] OpenCode server unavailable (${e.message}) — falling back to "opencode run"`);
+    return runOpenCodeRun(job, message, hooks);
+  }
+  return runOpenCodeServe(job, message, hooks);
 }
 
 function firstRunMessage(job) {
@@ -119,7 +169,8 @@ export function findSheet(jobDir) {
 
 /**
  * Create the job folder + brief, then run the processor.
- * hooks: { status(text), sendAnimatic(job, renderPath, sheetPath), deliver(job, result) }
+ * hooks: { status(text), relay, sendAnimatic(job, renderPath, sheetPath),
+ *          deliver(job, result) }
  */
 export async function processJob(job, hooks) {
   const date = new Date(job.createdAt || Date.now());
@@ -142,11 +193,11 @@ export async function processJob(job, hooks) {
     if (now - lastRelay > 20000) { lastRelay = now; hooks.status(`⏳ ${job.id}: ${text}`); }
   };
 
-  await hooks.status(`🎬 ${job.id} শুরু হলো — mode: ${job.mode}, style: ${job.style}, ${job.aspect}, model: ${job.provider}/${job.model}`);
-  await runOpenCode(job, firstRunMessage(job), { onProgress });
+  await hooks.status(`🎬 ${job.id} started — mode: ${job.mode}, style: ${job.style}, ${job.aspect}, model: ${job.provider}/${job.model}`);
+  await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
 
   const render = findRender(job.jobDir);
-  if (!render) throw new Error('OpenCode run শেষ, কিন্তু render/ ফোল্ডারে কোনো .mp4 পাওয়া যায়নি। review.md দেখুন।');
+  if (!render) throw new Error('The OpenCode run finished, but no .mp4 was found in the render/ folder. See review.md.');
 
   if (!job.finalNow) {
     // Animatic stage: hand the preview to the user; feedback continues this
@@ -160,7 +211,7 @@ export async function processJob(job, hooks) {
 
 /** Continue the session with one user feedback message. */
 export async function sendFeedback(job, text, hooks) {
-  await runOpenCode(job, `User feedback (quote it verbatim in review.md, apply it, re-render the animatic + contact sheet, then stop again): ${text}`, {});
+  await runOpenCode(job, `User feedback (quote it verbatim in review.md, apply it, re-render the animatic + contact sheet, then stop again): ${text}`, { relay: hooks.relay });
   const render = findRender(job.jobDir);
   if (render) await hooks.sendAnimatic(job, render, findSheet(job.jobDir));
   return render;
@@ -169,16 +220,16 @@ export async function sendFeedback(job, text, hooks) {
 /** Final render + QC + store + delivery. */
 export async function finalizeJob(job, hooks, knownRender) {
   if (!knownRender) {
-    await runOpenCode(job, 'User approved: render the FINAL full-resolution master now (mastering −16 LUFS / TP −1.2), update review.md, and delete frames/ after a successful render.', {});
+    await runOpenCode(job, 'User approved: render the FINAL full-resolution master now (mastering −16 LUFS / TP −1.2), update review.md, and delete frames/ after a successful render.', { relay: hooks.relay });
   }
   const render = knownRender || findRender(job.jobDir);
-  if (!render) throw new Error('Final render পাওয়া যায়নি।');
+  if (!render) throw new Error('Final render not found.');
 
   // Vision QC is advisory: it never blocks delivery, it reports.
   let qc = null;
   const sheet = findSheet(job.jobDir);
   if (sheet && env('NVIDIA_API_KEY')) {
-    try { qc = await qcContactSheet(sheet); } catch (e) { qc = { pass: null, issues: [`QC চলেনি: ${e.message}`] }; }
+    try { qc = await qcContactSheet(sheet); } catch (e) { qc = { pass: null, issues: [`QC did not run: ${e.message}`] }; }
   }
 
   const stored = storeFile(job.id, render);
