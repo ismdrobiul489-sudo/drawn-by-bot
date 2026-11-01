@@ -41,7 +41,7 @@ cat <<'EOF'
 ──────────────────────────────────────────────────────────────
 INSTALL DONE. Two things left:
 
-  1. Fill in .env  (nano .env) — at minimum:
+  1. Fill in .env with:  bash setup-env.sh  (answer 5 questions — no editor needed). It needs:
        TELEGRAM_BOT_TOKEN   (from @BotFather — a NEW bot)
        OWNER_TELEGRAM_ID    (your numeric Telegram id)
        GROQ_API_KEY

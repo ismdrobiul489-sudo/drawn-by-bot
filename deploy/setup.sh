@@ -30,7 +30,7 @@ systemctl daemon-reload
 cat <<'EOF'
 
 Setup done. Before enabling the service:
-  1. cp .env.example .env  and fill in real values (bot token, owner id, keys, PUBLIC_BASE_URL)
+  1. bash setup-env.sh  and answer the questions (bot token, owner id, keys, PUBLIC_BASE_URL) — it writes .env for you
   2. Smoke-test Edge TTS ON THIS VPS (it was blocked from the dev VM's network):
        edge-tts --voice en-US-AriaNeural --text "Hello, this is a test." --write-media /tmp/t.mp3 && ls -la /tmp/t.mp3
   3. systemctl enable --now drawn-by-bot

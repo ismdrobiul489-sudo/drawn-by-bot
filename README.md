@@ -180,7 +180,8 @@ cd drawn-by-bot
 bash install.sh     # installs EVERYTHING: Node 20+, ffmpeg, Chromium,
                     # Edge TTS, OpenCode, the engine's npm dependency,
                     # the systemd unit — and creates .env from the example
-nano .env           # fill in the values listed below
+bash setup-env.sh   # answer 5 questions — it writes .env for you
+                    # (no text editor needed; made for phone terminals)
 bash run.sh         # preflight check + start the bot in this terminal
 ```
 
