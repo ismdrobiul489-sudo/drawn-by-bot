@@ -46,7 +46,24 @@ ask GROQ_API_KEY       "Groq API key" yes
 ask NVIDIA_API_KEY     "NVIDIA API key" yes
 ask PUBLIC_BASE_URL    "Public base URL of this server (optional — Enter to skip, e.g. http://203.0.113.10:8090)"
 
-# Build .env from the example, replacing exactly the asked keys.
+# Default provider: any letter case accepted, stored lowercase (groq|nvidia).
+while true; do
+  cur="$(current DEFAULT_PROVIDER)"
+  printf 'Default provider — groq or nvidia [%s]: ' "${cur:-groq}"
+  read -r ans || ans=""
+  ans="$(printf '%s' "$ans" | tr -d ' \r')"
+  [ -z "$ans" ] && ans="${cur:-groq}"
+  norm="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+  case "$norm" in
+    groq|nvidia) VALUES["DEFAULT_PROVIDER"]="$norm"; break ;;
+    *) echo "  Please answer groq or nvidia." ;;
+  esac
+done
+
+# Build .env from the EXISTING .env when there is one (so manual edits to
+# other lines — e.g. a default model — survive a re-run), else the example.
+SRC="$BASE"
+[ -f "$ENV_FILE" ] && SRC="$ENV_FILE"
 tmp="$(mktemp)"
 while IFS= read -r line; do
   replaced=0
@@ -60,7 +77,7 @@ while IFS= read -r line; do
     esac
   done
   [ "$replaced" -eq 0 ] && printf '%s\n' "$line" >> "$tmp"
-done < "$BASE"
+done < "$SRC"
 mv "$tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
