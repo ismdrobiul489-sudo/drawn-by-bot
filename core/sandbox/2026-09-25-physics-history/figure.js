@@ -1,0 +1,481 @@
+// Full-body figures for physics-history, drawn as riso separations. A pose is a handful of
+// targets (pelvis, chest, head, hands, ankles); elbows and knees come from two-bone IK with
+// fixed lengths, so limbs never stretch. Proportions follow a 7.5-head figure with an
+// upright spine: the head sits over the shoulders, the back is a straight line from the
+// neck to the pelvis (no hunch). Global: Fig.
+//
+//   Fig.pose(keys, t)                 keys: [[t, pose], …] → the pose at t (eased per key)
+//   Fig.newton(press, pose, o)        Newton in coat, waistcoat, breeches, stockings, shoes
+//
+// Pose (local units, y down, feet on the ground line): { u, P, C, H, tilt, hN, hF, fN, fF,
+// toeN, toeF, gripN, gripF, face }. N = the near side (the figure's right when facing
+// right), F = far. gripX: 0 open hand … 1 fist, or 'apple' (holding something round).
+const Fig = (() => {
+    const { put, line, smooth, poly, taper, circle, ellipse } = Ph;
+    const L = (a, b, t) => a + (b - a) * t;
+    const LP = (p, q, t) => [L(p[0], q[0], t), L(p[1], q[1], t)];
+    const add = (p, dx, dy) => [p[0] + dx, p[1] + dy];
+
+    function pose(keys, t) {
+        let i = 0;
+        while (i < keys.length - 2 && t >= keys[i + 1][0]) i++;
+        const [t0, a] = keys[i], [t1, b] = keys[Math.min(i + 1, keys.length - 1)];
+        const k = t1 > t0 ? Ease.inOut(Math.max(0, Math.min(1, (t - t0) / (t1 - t0)))) : 0;
+        const out = {};
+        for (const key of Object.keys(a)) {
+            const va = a[key], vb = b[key] ?? va;
+            out[key] = Array.isArray(va) ? LP(va, vb, k) : typeof va === 'number' && typeof vb === 'number' ? L(va, vb, k) : k < 0.5 ? va : vb;
+        }
+        return out;
+    }
+    // two-bone IK; pick: 'fwd' | 'back' | 'up' | 'down' chooses between the two solutions
+    function ik(s, w, a, b, pick, face = 1) {
+        const dx = w[0] - s[0], dy = w[1] - s[1], d = Math.min(Math.hypot(dx, dy), a + b - 0.01);
+        const ang = Math.atan2(dy, dx), c = Math.acos(Math.max(-1, Math.min(1, (a * a + d * d - b * b) / (2 * a * d))));
+        const e1 = [s[0] + Math.cos(ang + c) * a, s[1] + Math.sin(ang + c) * a], e2 = [s[0] + Math.cos(ang - c) * a, s[1] + Math.sin(ang - c) * a];
+        // pick: a keyword, or a pole point (the joint goes to the solution nearer to it, so a
+        // pole that moves smoothly makes the joint move smoothly: no flip between keys)
+        const score = Array.isArray(pick) ? (e) => -Math.hypot(e[0] - pick[0], e[1] - pick[1]) : (e) => (pick === 'fwd' ? e[0] * face : pick === 'back' ? -e[0] * face : pick === 'up' ? -e[1] : e[1]);
+        const e = score(e1) >= score(e2) ? e1 : e2;
+        // clamp the wrist to reach
+        const wr = [s[0] + Math.cos(ang) * d, s[1] + Math.sin(ang) * d];
+        const r = Math.hypot(w[0] - s[0], w[1] - s[1]) > a + b ? [e[0] + (wr[0] - e[0]) * (b / Math.hypot(wr[0] - e[0], wr[1] - e[1])), e[1] + (wr[1] - e[1]) * (b / Math.hypot(wr[0] - e[0], wr[1] - e[1]))] : w;
+        return [e, r];
+    }
+    // a limb segment: a filled capsule between two points, widths at each end
+    function seg(press, a, b, wa, wb, spec) {
+        line(press, [a, LP(a, b, 0.5), b], (u) => L(wa, wb, u), spec);
+        put(press, circle(a[0], a[1], wa / 2), spec);
+        put(press, circle(b[0], b[1], wb / 2), spec);
+    }
+    // a hand at the wrist w pointing along dir (radians); grip 0 open … 1 fist; s = size
+    function hand(press, w, dir, grip, s, spec, sh, lineSpec, face = 1) {
+        const R = (x, y) => [w[0] + Math.cos(dir) * x - Math.sin(dir) * y * face, w[1] + Math.sin(dir) * x + Math.cos(dir) * y * face];
+        const g = typeof grip === 'number' ? grip : 0.55;
+        // palm
+        put(press, (c) => smooth(c, [R(-0.05 * s, -0.22 * s), R(0.45 * s, -0.26 * s), R(0.62 * s, -0.05 * s), R(0.6 * s, 0.2 * s), R(0.3 * s, 0.3 * s), R(0, 0.22 * s)]), spec);
+        // four fingers: straight when open, curled towards the palm when gripping
+        for (let i = 0; i < 4; i++) {
+            const y = (-0.2 + i * 0.13) * s, len = (0.5 - Math.abs(i - 1.3) * 0.06) * s;
+            const k1 = R(0.55 * s, y), bend = g * 1.9;
+            const k2 = [k1[0] + Math.cos(dir + bend * face * 0.55) * len * 0.5, k1[1] + Math.sin(dir + bend * face * 0.55) * len * 0.5];
+            const k3 = [k2[0] + Math.cos(dir + bend * face) * len * 0.45, k2[1] + Math.sin(dir + bend * face) * len * 0.45];
+            line(press, [k1, k2, k3], taper(0.15 * s, 0.05, 0.35), i === 0 ? spec : sh);
+        }
+        // thumb: out to the side, closing over the fingers when gripping
+        const t0 = R(0.12 * s, -0.24 * s), t1 = R((0.35 + g * 0.15) * s, (-0.5 + g * 0.3) * s), t2 = R((0.52 + g * 0.1) * s, (-0.52 + g * 0.42) * s);
+        line(press, [t0, t1, t2], taper(0.17 * s, 0.1, 0.4), spec);
+        line(press, [R(0.18 * s, -0.12 * s), R(0.5 * s, -0.12 * s)], taper(0.03 * s), lineSpec);
+    }
+
+    // the near (right) hand holding an apple up to look at it, as the scene shows it: Newton in
+    // profile facing +x, palm up, so we see the hand's little-finger edge; the apple sits in the
+    // palm, the fingers curl up round its front (the little finger nearest us, the others just
+    // behind, their tips beyond the apple's edge), the thumb is on the far side, its tip showing
+    // over the apple's top. Local frame: x along the forearm (from the elbow), y the palm's
+    // normal pointing up. w: the wrist; dir: the forearm's angle; R: the apple's radius; world
+    // units (a real hand: palm 2.6 R long, fingers 2 R). Returns the apple's centre.
+    // mode 'pick': reaching down, the back of the hand up, the palm on the apple's top;
+    // 'cock': winding up to throw, the back of the hand down, the apple on the palm; both seen
+    // from the little finger's side. 'hold' (the back of the hand to the camera) is holdBack.
+    function holdApple(press, w, dir, f, R, spec, sh, held, mode = 'cock', at = null) {
+        if (mode === 'hold') return holdSide(press, w, dir, f, R, spec, sh, held);
+        if (mode === 'pick') return pickUp(press, w, f, R, spec, sh, held, at);
+        // winding up to throw: the back of the hand to the camera too, the apple in the fist
+        if (mode === 'cock') return holdSide(press, w, dir, f, R, spec, sh, held, 1.6);
+        // x along the forearm (from the elbow), y towards the apple: down to the ground when
+        // picking it up, up to the sky when winding up (the palm faces the apple)
+        const ux = Math.cos(dir), uy = Math.sin(dir);
+        let nx = -uy, ny = ux;
+        if ((mode === 'pick' ? ny < 0 : ny > 0)) { nx = -nx; ny = -ny; }
+        const X = (x, y) => [w[0] + (ux * x + nx * y) * R, w[1] + (uy * x + ny * y) * R];
+        const lw = Math.max(1.6, R * 0.07), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        const C = [1.5, 1.35];                                     // the apple, against the palm
+        const onA = (t, r) => X(C[0] + Math.cos(t) * r, C[1] + Math.sin(t) * r);
+        const arc = (t0, t1, r, n = 10) => Array.from({ length: n + 1 }, (_, i) => onA(t0 + (t1 - t0) * i / n, r));
+        // t = 0 points along the forearm (beyond the apple), t = π/2 back to the palm, t = −π/2 … no:
+        // here y grows towards the face, so t = +π/2 is the face's side, t = −π/2 the palm's
+        const finger = (P, wd, spc, contour) => {
+            line(press, P, wd * R, spc);
+            const e = P[P.length - 1];
+            put(press, circle(e[0], e[1], wd * R * 0.5), spc);
+            if (contour) {
+                const ol = Ph.outline(P, wd * R), h = ol.length / 2;
+                line(press, ol.slice(0, h), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+                // the round of the tip, where it lies on the apple
+                const tp = P[P.length - 1], pv = P[P.length - 2], an = Math.atan2(tp[1] - pv[1], tp[0] - pv[0]), rr = wd * R * 0.5;
+                line(press, Array.from({ length: 7 }, (_, i) => { const aa = an - Math.PI / 2 + (i / 6) * Math.PI; return [tp[0] + Math.cos(aa) * rr, tp[1] + Math.sin(aa) * rr]; }), lw, EDGE, { knock: false });
+            }
+        };
+        // behind the apple: the thumb from the heel round its lower far side, the tip on its
+        // face-side bottom; the ring, middle and index fingers over its top, their tips on the
+        // face side (each a little longer and further back than the one before)
+        finger([X(0.35, 0.3), X(0.4, 0.95), onA(2.3, 1.02)], 0.52, sh, false);
+        for (const [r, t1, wd] of [[1.18, 1.45, 0.4], [1.2, 1.2, 0.42], [1.18, 0.9, 0.4]]) finger(arc(-0.95, t1, r), wd, spec, true);
+        held(press, X(C[0], C[1]));
+        // the palm's little-finger edge, from the wrist to the knuckles, against the apple
+        const PALM = [X(-0.25, -0.35), X(0.5, -0.45), X(1.5, -0.42), X(2.25, -0.32), X(2.45, 0.05), X(2.2, 0.3), X(1.4, 0.36), X(0.5, 0.3), X(-0.25, 0.3)];
+        put(press, (g) => smooth(g, PALM), spec);
+        press.save(); press.clip((g) => smooth(g, PALM));
+        Ph.ink(press, (g) => smooth(g, [X(-0.4, -0.6), X(2.6, -0.6), X(2.6, -0.2), X(-0.4, -0.2)]), { 'pink.s': 0.22 });
+        press.restore();
+        line(press, Ph.sample([X(-0.25, -0.35), X(0.5, -0.45), X(1.5, -0.42), X(2.25, -0.32)], false, 6), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+        // the little finger, nearest us: from its knuckle at the palm's end over the apple's top
+        finger(arc(-1.0, 0.6, 1.16), 0.38, spec, true);
+        const k = onA(-0.35, 1.16), k2 = onA(-0.35, 1.16 + 0.2);
+        line(press, [onA(-0.35, 0.98), k2], taper(lw * 0.8), EDGE, { knock: false });
+        return X(C[0], C[1]);
+    }
+
+    // picking the apple up from the ground (after a photo of a hand reaching down to pick
+    // something up): the hand comes down on it from above, the back of the hand up, the palm on
+    // its top, the fingers draped down its far side; seen from the little finger's side. A: the
+    // apple where it lies.
+    function pickUp(press, w, f, R, spec, sh, held, A) {
+        const lw = Math.max(1.4, R * 0.06), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        held(press, A);
+        const top = Math.atan2(w[1] - A[1], w[0] - A[0]);
+        const on = (t, r) => [A[0] + Math.cos(t) * r * R, A[1] + Math.sin(t) * r * R];
+        const arc = (t0, t1, r, n = 12) => Array.from({ length: n + 1 }, (_, i) => on(t0 + (t1 - t0) * i / n, r));
+        const T = (k) => top + f * k;                    // k > 0: over the top, down the front
+        const kn = on(T(0.75), 1.25);                    // the knuckles, on the apple's top
+        const d = [kn[0] - w[0], kn[1] - w[1]], L0 = Math.hypot(d[0], d[1]) || 1, n = [-d[1] / L0, d[0] / L0];
+        const P = (p, k) => [p[0] + n[0] * k * R, p[1] + n[1] * k * R];
+        // the fingers behind (ring, middle, index): a little further round, in shade
+        for (const [k1, wd] of [[2.35, 0.44], [2.2, 0.46], [2.0, 0.44]]) {
+            const Q = arc(T(0.75), T(k1), 1.22);
+            line(press, Q, wd * R, sh);
+            put(press, circle(...Q[Q.length - 1], wd * R * 0.5), sh);
+        }
+        // the back of the hand: from the wrist to the knuckles, as thick as a hand seen edge on
+        const BACK = [P(w, 0.42), P([w[0] + d[0] * 0.5, w[1] + d[1] * 0.5], 0.5), P(kn, 0.4), P(kn, -0.36), P([w[0] + d[0] * 0.5, w[1] + d[1] * 0.5], -0.44), P(w, -0.42)];
+        put(press, (g) => smooth(g, BACK), spec);
+        press.save(); press.clip((g) => smooth(g, BACK));
+        const s0 = P(w, -0.6), s1 = P(w, 0.1);
+        Ph.ink(press, (g) => g.rect(Math.min(w[0], kn[0]) - 2 * R, Math.min(w[1], kn[1]) - 2 * R, 5 * R, 5 * R), { 'pink.s': (g) => Riso.ramp(g, s0[0], s0[1], s1[0], s1[1], 0.24, 0) });
+        press.restore();
+        // the little finger, nearest: from the knuckle over the top, down the front
+        const LF = arc(T(0.75), T(1.85), 1.2);
+        line(press, LF, 0.4 * R, spec);
+        put(press, circle(...LF[LF.length - 1], 0.2 * R), spec);
+        const ol = Ph.outline(LF, 0.4 * R), h = ol.length / 2;
+        line(press, ol.slice(0, h), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+        line(press, Ph.sample(BACK.slice(0, 3), false, 5), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+        return A;
+    }
+
+    // holding the apple seen from the side of the hand (the index side): the back of the hand
+    // edge-on as a band from the wrist to the knuckle, whose bump shows in profile at its end;
+    // the index finger curls from the knuckle round the apple's far side, its joints as bumps on
+    // its outer edge; the other fingers' tips peek out behind it, stepped; the thumb comes from
+    // the heel round the apple's near side, its nail towards us
+    function wrinkles2(press, c, an, w, lw, spec) {
+        const nx = -Math.sin(an), ny = Math.cos(an);
+        for (const o of [-2, 2]) line(press, [[c[0] - nx * w * 0.3 + Math.cos(an) * o, c[1] - ny * w * 0.3 + Math.sin(an) * o], [c[0] + nx * w * 0.3 + Math.cos(an) * o, c[1] + ny * w * 0.3 + Math.sin(an) * o]], Ph.taper(lw * 0.7), spec, { knock: false });
+    }
+    function holdSide(press, w, dir, f, R, spec, sh, held, reach = 1.15) {
+        const dx = Math.cos(dir), dy = Math.sin(dir);
+        let qx = -dy, qy = dx;
+        if (qx * f < 0) { qx = -qx; qy = -qy; }
+        const X = (a, b) => [w[0] + (dx * a + qx * b) * R, w[1] + (dy * a + qy * b) * R];
+        const lw = Math.max(1.4, R * 0.06), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        const C = [1.45, reach + 0.15];
+        const on = (t, r) => X(C[0] + Math.cos(t) * r, C[1] + Math.sin(t) * r);
+        const arc = (t0, t1, r, n = 12) => Array.from({ length: n + 1 }, (_, i) => on(t0 + (t1 - t0) * i / n, r));
+        const dig = (P, wd, spc, edge) => {
+            line(press, P, wd * R, spc);
+            put(press, circle(...P[0], wd * R * 0.5), spc);
+            put(press, circle(...P[P.length - 1], wd * R * 0.5), spc);
+            if (edge) { const ol = Ph.outline(P, wd * R), h = ol.length / 2; line(press, ol.slice(0, h), taper(lw, 0.1, 0.1), EDGE, { knock: false }); }
+        };
+        // the fingers behind the index: their tips stepped along the apple's front
+        for (const [t1, dt] of [[0.2, 0.5], [0.1, 0.3], [0.0, 0.15]]) dig([X(1.95, 0.1 + dt * 0.3)].concat(arc(-0.45 + dt * 0.4, t1, 1.04)), 0.26, sh, false);
+        // the thumb is on the far side of the hand (a right hand seen from its little-finger
+        // side): behind the apple, only its tip showing past the apple's near edge
+        const TH = [X(0.45, 0.35), X(0.95, 0.85), on(2.35, 1.0)];
+        dig(TH, 0.46, sh, false);
+        held(press, X(C[0], C[1]));
+        // the back of the hand, edge-on: a band as thick as a hand, the knuckle's bump at its end
+        const BAND = [X(-0.35, -0.42), X(0.8, -0.42), X(1.75, -0.36), X(2.08, -0.22), X(2.16, 0.02), X(1.98, 0.24), X(1.2, 0.32), X(0.3, 0.34), X(-0.35, 0.38)];
+        put(press, (g) => smooth(g, BAND), spec);
+        press.save(); press.clip((g) => smooth(g, BAND));
+        Ph.ink(press, (g) => smooth(g, [X(-0.5, 0.1), X(2.4, 0.1), X(2.4, 0.6), X(-0.5, 0.6)]), { 'pink.s': 0.22 });
+        press.restore();
+        line(press, Ph.sample([X(-0.35, -0.42), X(0.8, -0.42), X(1.75, -0.36), X(2.08, -0.22), X(2.16, 0.02)], false, 6), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+        // the little finger, nearest: from the knuckle round the apple's far side to its front
+        // (starting at the knuckle, at the end of the back of the hand, so the finger grows out of it)
+        const IX = [X(2.0, 0.05)].concat(arc(-0.5, -0.2, 1.06));
+        dig(IX, 0.26, spec, true);
+        for (const k of [4]) { const p = IX[k], q = IX[k + 1], an = Math.atan2(q[1] - p[1], q[0] - p[0]); line(press, [[p[0] - Math.sin(an) * R * 0.12, p[1] + Math.cos(an) * R * 0.12], [p[0] + Math.sin(an) * R * 0.12, p[1] - Math.cos(an) * R * 0.12]], taper(lw * 0.8), EDGE, { knock: false }); }
+        // the thumb: from the heel, round the apple's near side, the nail at its tip
+        return X(C[0], C[1]);
+    }
+
+    // holding the apple up with the back of the hand to the camera (after a photo of a cupped
+    // hand): the back of the hand along the forearm, the knuckles' row at its end; the four
+    // fingers bend forward round the apple, stacked (the index furthest from the wrist), their
+    // backs to us with a crease at each middle joint, the tips curling round its far side; the
+    // apple shows past the index, past the fingertips and under the little finger; the thumb is
+    // behind it, its tip showing at the apple's top
+    function holdBack(press, w, dir, f, R, spec, sh, held, reach = 1.15) {
+        const dx = Math.cos(dir), dy = Math.sin(dir);   // along the forearm, towards the hand
+        let qx = -dy, qy = dx;                            // forward, across it
+        if (qx * f < 0) { qx = -qx; qy = -qy; }
+        const X = (a, b) => [w[0] + (dx * a + qx * b) * R, w[1] + (dy * a + qy * b) * R];
+        const lw = Math.max(1.4, R * 0.06), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        const A = X(1.35, reach);
+        held(press, A);
+        // the thumb's tip on the far side, over the apple's top
+        put(press, circle(...X(2.25, 0.75), 0.24 * R), sh);
+        // the back of the hand: from the wrist to the knuckles, a little wider at the knuckles
+        // as wide at the wrist as the forearm, so the hand continues it (no pinch at the joint)
+        const BACK = [X(-0.35, -0.62), X(0.9, -0.6), X(2.05, -0.4), X(2.2, 0.15), X(2.1, 0.55), X(1.2, 0.62), X(0.3, 0.62), X(-0.35, 0.6)];
+        put(press, (g) => smooth(g, BACK), spec);
+        press.save(); press.clip((g) => smooth(g, BACK));
+        Ph.ink(press, (g) => smooth(g, [X(-0.2, -0.7), X(2.4, -0.7), X(2.4, -0.25), X(-0.2, -0.25)]), { 'pink.s': 0.2 });
+        for (const k of [0.3, 0.75, 1.2, 1.65]) line(press, [X(0.35, 0.02 + k * 0.05), X(k + 0.35, 0.3)], taper(R * 0.08, 0.3, 0.3), { 'pink.s': 0.1 }, { knock: false });
+        press.restore();
+        // the fingers, index (furthest along the forearm) to little: bands going forward from the
+        // knuckles over the apple's near face, the tips turning round its far edge
+        const F = [[1.95, 0.44, 1.5], [1.52, 0.46, 1.62], [1.1, 0.44, 1.55], [0.72, 0.38, 1.3]];
+        for (const [a, wd, len] of F) {
+            const P = Ph.sample([X(a, 0.35), X(a + 0.04, 0.35 + len * 0.55), X(a - 0.05, 0.35 + len * 0.92), X(a - 0.22, 0.35 + len)], false, 6);
+            line(press, P, wd * R, spec);
+            put(press, circle(P[0][0], P[0][1], wd * R * 0.5), spec);
+            const e = P[P.length - 1];
+            put(press, circle(e[0], e[1], wd * R * 0.5), spec);
+            // the finger's edge towards the wrist (the gap to the next finger) and its tip
+            const ol = Ph.outline(P, wd * R), h = ol.length / 2;
+            line(press, ol.slice(h, ol.length - 1), taper(lw, 0.1, 0.2), EDGE, { knock: false });
+            const pv = P[P.length - 2], an = Math.atan2(e[1] - pv[1], e[0] - pv[0]), rr = wd * R * 0.5;
+            line(press, Array.from({ length: 7 }, (_, i) => { const t = an - Math.PI / 2 + (i / 6) * Math.PI; return [e[0] + Math.cos(t) * rr, e[1] + Math.sin(t) * rr]; }), lw * 0.9, EDGE, { knock: false });
+            // the middle joint: a light bump and a short crease
+            const m = X(a + 0.03, 0.35 + len * 0.5);
+            press.knockout(ellipse(m[0], m[1], wd * R * 0.22, wd * R * 0.14, dir));
+            line(press, [X(a - wd * 0.3, 0.35 + len * 0.56), X(a, 0.35 + len * 0.6), X(a + wd * 0.3, 0.35 + len * 0.56)], taper(lw * 0.8), EDGE, { knock: false });
+        }
+        // the knuckles' row: light bumps where the fingers leave the back of the hand
+        for (const [a, wd] of F) { const k = X(a, 0.3); press.knockout(ellipse(k[0], k[1], wd * R * 0.2, wd * R * 0.16, 0)); }
+        line(press, Ph.sample([X(-0.35, -0.62), X(0.9, -0.6), X(2.05, -0.4), X(2.2, 0.15)], false, 6), taper(lw, 0.1, 0.1), EDGE, { knock: false });
+        return A;
+    }
+
+    // a right hand with its back to the camera, fingers together and gently curved (resting on
+    // something: the top of his head). w: the wrist; dir: from the wrist to the fingers; s: the
+    // hand's length (wrist to middle fingertip). For a right hand seen from its back the thumb is
+    // on the side t = (dy, −dx) (fingers up → thumb on the viewer's left).
+    function backHand(press, w, dir, s, spec, sh) {
+        const dx = Math.cos(dir), dy = Math.sin(dir), tx = dy, ty = -dx;
+        const X = (a, b) => [w[0] + (dx * a + tx * b) * s, w[1] + (dy * a + ty * b) * s];
+        const lw = Math.max(1, s * 0.035), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        // the thumb, alongside, lower: from the heel on its side, pointing along the fingers
+        const TH = [X(0.08, 0.2), X(0.26, 0.3), X(0.4, 0.3)];
+        line(press, TH, 0.14 * s, spec); put(press, circle(...TH[2], 0.07 * s), spec); // the same skin as the hand
+        // the back of the hand
+        const PALM = [X(-0.05, -0.19), X(0.52, -0.21), X(0.56, 0), X(0.52, 0.21), X(-0.05, 0.2)];
+        put(press, (g) => smooth(g, PALM), spec);
+        // the fingers: index (thumb side) to little; each a band of three joints, curving over
+        const F = [[0.15, 0.4], [0.05, 0.45], [-0.05, 0.42], [-0.15, 0.33]];
+        F.forEach(([b, L0], i) => {
+            const P = Ph.sample([X(0.5, b), X(0.5 + L0 * 0.55, b * 1.05), X(0.5 + L0 * 0.95, b * 1.08)], false, 5);
+            line(press, P, 0.1 * s, spec);
+            put(press, circle(...P[P.length - 1], 0.05 * s), spec);
+            // the gap to the next finger and a crease at the middle joint
+            if (i < 3) line(press, [X(0.52, b - 0.05), X(0.5 + Math.min(L0, F[i + 1][1]) * 0.9, b - 0.05)], taper(lw * 0.9, 0.2, 0.3), EDGE, { knock: false });
+            line(press, [X(0.5 + L0 * 0.55, b - 0.03), X(0.5 + L0 * 0.57, b + 0.03)], taper(lw * 0.8), EDGE, { knock: false });
+            press.knockout(ellipse(...X(0.5, b), 0.03 * s, 0.03 * s));
+        });
+        // tendons on the back of the hand
+        for (const [b] of F) line(press, [X(0.05, b * 0.4), X(0.45, b)], taper(0.018 * s, 0.3, 0.3), { 'pink.s': 0.14 }, { knock: false });
+    }
+
+    // an open hand seen from its thumb side, fingers straight and together (reaching, pointing,
+    // balancing a throw): the edge of the palm from the wrist, the index finger nearest with the
+    // others' tips stepped behind it, the thumb below and apart. w: the wrist; dir: from the wrist
+    // to the fingers; s: the hand's length; down: the side the thumb is on (unit, screen).
+    function openSide(press, w, dir, s, spec, down) {
+        const dx = Math.cos(dir), dy = Math.sin(dir);
+        let tx = -dy, ty = dx;
+        if (tx * down[0] + ty * down[1] < 0) { tx = -tx; ty = -ty; }
+        const X = (a, b) => [w[0] + (dx * a + tx * b) * s, w[1] + (dy * a + ty * b) * s];
+        const lw = Math.max(1, s * 0.035), EDGE = { 'pink.s': 0.7, 'navy.s': 0.55 };
+        // the other fingers behind the index: their tops stepped above it
+        for (const [b, L0] of [[-0.12, 0.44], [-0.09, 0.47], [-0.06, 0.4]]) {
+            const P = [X(0.45, b), X(0.45 + L0 * 0.6, b - 0.01), X(0.45 + L0, b + 0.01)];
+            line(press, P, 0.1 * s, spec); put(press, circle(...P[2], 0.05 * s), spec);
+        }
+        // the palm's edge and the thumb
+        put(press, (g) => smooth(g, [X(-0.05, -0.13), X(0.48, -0.15), X(0.5, 0.06), X(0.25, 0.14), X(-0.05, 0.12)]), spec);
+        const TH = [X(0.12, 0.08), X(0.32, 0.2), X(0.48, 0.24)];
+        line(press, TH, 0.12 * s, spec); put(press, circle(...TH[2], 0.06 * s), spec);
+        // the index, nearest, its joints; the line between it and the fingers behind
+        const IX = [X(0.44, -0.02), X(0.68, -0.03), X(0.86, -0.01)];
+        line(press, IX, 0.11 * s, spec); put(press, circle(...IX[2], 0.055 * s), spec);
+        line(press, [X(0.5, -0.075), X(0.86, -0.065)], taper(lw, 0.2, 0.3), EDGE, { knock: false });
+        for (const a of [0.62, 0.78]) line(press, [X(a, -0.06), X(a + 0.01, 0.02)], taper(lw * 0.8), EDGE, { knock: false });
+        line(press, [X(0.3, 0.1), X(0.38, 0.15)], taper(lw * 0.8), EDGE, { knock: false });
+    }
+
+    // ── Newton ───────────────────────────────────────────────────────────────────────────
+    const COAT = { navy: 1, yellow: 1, 'pink.s': 0.55 };
+    const COAT_FAR = { navy: 1, yellow: 1, pink: 0.8 };
+    const COAT_LIT = { navy: 1, 'yellow.s': 0.6, 'pink.s': 0.45, 'blue.s': 0.25 };
+    const CUFF = { navy: 1, 'yellow.s': 0.7, 'pink.s': 0.45, 'blue.s': 0.3 }; // the coat's cloth, turned back (lighter)
+    const VEST = { 'yellow.s': 0.75, 'pink.s': 0.5, 'navy.s': 0.3 };
+    const STOCK = { 'blue.s': 0.2, 'navy.s': 0.08 };
+    const STOCK_FAR = { 'blue.s': 0.45, 'navy.s': 0.3 };
+    const SHOE = { navy: 1, yellow: 0.9, 'pink.s': 0.4 };
+    const SKIN = { 'yellow.s': 0.12, 'pink.s': 0.07 };
+    const SKIN_SH = { 'yellow.s': 0.3, 'pink.s': 0.36, 'navy.s': 0.06 };
+    const LINE = { 'pink.s': 0.55, 'navy.s': 0.4 };
+    const LINEN = { 'blue.s': 0.05, 'yellow.s': 0.05 };
+
+    function newton(press, p, o = {}) {
+        const u = p.u, f = p.face ?? 1;
+        let held = null;
+        const UA = 1.45 * u, FA = 1.25 * u, TH = 1.95 * u, SH = 1.95 * u;
+        const shN = add(p.C, -0.12 * u * f, 0.06 * u), shF = add(p.C, 0.22 * u * f, -0.04 * u);
+        const hipN = add(p.P, 0.1 * u * f, 0), hipF = add(p.P, -0.1 * u * f, -0.04 * u);
+        // poles are offsets from the shoulder / hip (p.poleN, p.poleF, p.kneeN, p.kneeF)
+        const pole = (o, base, kw) => (o ? [base[0] + o[0] * f, base[1] + o[1]] : kw);
+        const [elF, wrF] = ik(shF, p.hF, UA, FA, pole(p.poleF, shF, p.elbowF ?? 'back'), f);
+        const [elN, wrN] = ik(shN, p.hN, UA, FA, pole(p.poleN, shN, p.elbowN ?? 'back'), f);
+        const [knF, anF] = ik(hipF, p.fF, TH, SH, pole(p.kneeF, hipF, 'fwd'), f);
+        const [knN, anN] = ik(hipN, p.fN, TH, SH, pole(p.kneeN, hipN, 'fwd'), f);
+        const dirOf = (a, b) => Math.atan2(b[1] - a[1], b[0] - a[0]);
+        const shoe = (an, toe, spec) => {
+            const d = f * (toe ?? 0);
+            const R = (x, y) => [an[0] + (Math.cos(d) * x - Math.sin(d) * y) * f, an[1] + Math.sin(d) * x * f + Math.cos(d) * y];
+            put(press, (g) => smooth(g, [R(-0.2 * u, -0.12 * u), R(0.2 * u, -0.16 * u), R(0.62 * u, -0.02 * u), R(0.66 * u, 0.1 * u), R(-0.18 * u, 0.1 * u)]), spec);
+            put(press, (g) => poly(g, [R(0.12 * u, -0.14 * u), R(0.3 * u, -0.12 * u), R(0.3 * u, -0.02 * u), R(0.12 * u, -0.04 * u)]), { yellow: 1, 'pink.s': 0.25 });
+        };
+        const leg = (hip, kn, an, far, toe) => {
+            // breeches to the knee (buckled band), stocking below, shoe
+            seg(press, kn, an, 0.38 * u, 0.24 * u, far ? STOCK_FAR : STOCK);
+            // the calf's curve at the back of the shin
+            const cb = LP(kn, an, 0.3), dirK = Math.atan2(an[1] - kn[1], an[0] - kn[0]);
+            put(press, (g) => { g.beginPath(); g.ellipse(cb[0] - Math.sin(dirK) * 0.06 * u * -f, cb[1] + Math.cos(dirK) * 0.06 * u * -f, 0.45 * u, 0.22 * u, dirK, 0, Math.PI * 2); }, far ? STOCK_FAR : STOCK);
+            line(press, [LP(kn, an, 0.2), LP(kn, an, 0.95)], taper(0.04 * u), { 'navy.s': 0.35 });
+            seg(press, hip, kn, 0.62 * u, 0.42 * u, far ? COAT_FAR : COAT);
+            put(press, circle(kn[0], kn[1], 0.22 * u), far ? COAT_FAR : COAT);
+            put(press, circle(kn[0] + 0.12 * u * f, kn[1] + 0.05 * u, 0.05 * u), { yellow: 1 });
+            shoe(an, toe, SHOE);
+        };
+        const arm = (sh, el, wr, far, grip) => {
+            const spec = far ? COAT_FAR : COAT;
+            seg(press, sh, el, 0.5 * u, 0.42 * u, spec);
+            seg(press, el, wr, 0.42 * u, 0.4 * u, spec);
+            if (!far) line(press, [LP(sh, el, 0.15), el, LP(el, wr, 0.6)], taper(0.08 * u), COAT_LIT);
+            // the wide turned-back cuff, the shirt's ruffle, the hand
+            const cd = dirOf(el, wr), cx = LP(el, wr, 0.78);
+            put(press, (g) => { g.beginPath(); g.ellipse(cx[0], cx[1], 0.2 * u, 0.26 * u, cd, 0, Math.PI * 2); }, far ? COAT_FAR : CUFF);
+            line(press, [add(cx, -Math.sin(cd) * 0.24 * u, Math.cos(cd) * 0.24 * u), add(cx, Math.sin(cd) * 0.24 * u, -Math.cos(cd) * 0.24 * u)], 0.04 * u, { yellow: 1, 'pink.s': 0.3 });
+            put(press, circle(wr[0], wr[1], 0.16 * u), LINEN);
+            // rubbing the head: the hand lies over the crown, fingers pointing back and down over it
+            if (grip === 'head') { const tg = [p.H[0] - 0.45 * u * f, p.H[1] - 0.35 * u]; backHand(press, wr, Math.atan2(tg[1] - wr[1], tg[0] - wr[0]), 0.72 * u, far ? SKIN_SH : SKIN, SKIN_SH); }
+            // relaxed at the side: the back of the hand out, the fingers along the forearm, curled a little
+            // pressing on the knee to get up: the palm on it, the fingers forward and down over it
+            else if (grip === 'knee') backHand(press, wr, Math.atan2(0.55, f), 0.72 * u, far ? SKIN_SH : SKIN, SKIN_SH);
+            // open and reaching: seen from its thumb side, the thumb down
+            else if (grip === 'open') openSide(press, add(wr, Math.cos(cd) * 0.1 * u, Math.sin(cd) * 0.1 * u), cd, 0.8 * u, { 'yellow.s': 0.2, 'pink.s': 0.16 }, [0, 1]); // skin, a touch warmer than the near hand so it reads against the pale sky // from the ruffle's edge
+            else if (grip === 'relax') backHand(press, wr, cd + 0.12 * f, 0.72 * u, far ? SKIN_SH : SKIN, SKIN_SH);
+            else if (grip === 'apple' && !far && o.held) held = holdApple(press, wr, cd, f, o.heldR ?? 30, SKIN, SKIN_SH, o.held, o.heldMode, o.heldAt);
+            else hand(press, add(wr, Math.cos(cd) * 0.08 * u, Math.sin(cd) * 0.08 * u), cd, grip, 0.62 * u, far ? SKIN_SH : SKIN, SKIN_SH, LINE, f);
+        };
+        // far arm and far leg first
+        arm(shF, elF, wrF, true, p.gripF ?? 0.3);
+        leg(hipF, knF, anF, true, p.toeF);
+        // the body: a straight back from the neck to the waist, a chest a little forward, a
+        // narrow waist; the coat's skirt flares from the waist to the knees in an A with folds
+        // torso offsets are in the body's frame: x across the body, y along the spine, so a
+        // leaning figure keeps its chest, waistcoat and seams where they belong
+        const spAng = Math.atan2(p.C[0] - p.P[0], p.P[1] - p.C[1]), ca = Math.cos(spAng), sa = Math.sin(spAng);
+        const tb = (q, dx, dy) => [q[0] + dx * ca - dy * sa, q[1] + dx * sa + dy * ca];
+        // the coat's skirt hangs from the waist by gravity: standing it falls to the knees,
+        // bending or squatting it still hangs down (behind the thighs), never along them
+        const back = -f;
+        const waistB = tb(p.P, back * 0.48 * u, -0.35 * u), waistF = tb(p.P, -back * 0.42 * u, -0.35 * u);
+        const ground = Math.max(anN[1], anF[1]);
+        const hemY = Math.min(waistB[1] + 2.05 * u, ground - 0.25 * u);
+        const skirtB = [waistB[0] + back * 0.35 * u, hemY];
+        const frontX = waistF[0] - back * 0.1 * u;
+        const skirt = [waistB, add(LP(waistB, skirtB, 0.5), back * 0.12 * u, 0), skirtB, [L(skirtB[0], frontX, 0.5), hemY + 0.06 * u], [frontX, hemY - 0.1 * u], LP(waistF, [frontX, hemY], 0.45), waistF];
+        put(press, (g) => smooth(g, skirt), COAT_FAR);
+        for (let i = 1; i < 4; i++) line(press, [LP(waistB, waistF, i / 4), LP(skirtB, [frontX, hemY - 0.1 * u], i / 4)], taper(0.05 * u, 0.3, 0.1), { navy: 1, pink: 0.9, yellow: 1 });
+        const neckB = tb(p.C, back * 0.2 * u, -0.3 * u), neckF = tb(p.C, -back * 0.16 * u, -0.32 * u);
+        const torso = [neckB, tb(p.C, back * 0.5 * u, -0.05 * u), tb(p.C, back * 0.52 * u, 0.6 * u), waistB, tb(p.P, back * 0.45 * u, 0.15 * u), tb(p.P, -back * 0.38 * u, 0.15 * u), waistF, tb(p.C, -back * 0.52 * u, 0.7 * u), tb(p.C, -back * 0.5 * u, 0.2 * u), neckF];
+        put(press, (g) => smooth(g, torso), COAT);
+        // waistcoat showing in the coat's opening, with buttons
+        const vt = tb(p.C, -back * 0.22 * u, -0.1 * u), vb = tb(p.P, -back * 0.3 * u, 0.05 * u);
+        put(press, (g) => smooth(g, [vt, tb(vt, -back * 0.26 * u, 0.12 * u), tb(vb, -back * 0.08 * u, 0), tb(vb, back * 0.14 * u, 0.02 * u), tb(vt, back * 0.08 * u, 0.25 * u)]), VEST);
+        for (let i = 0; i < 6; i++) {
+            const q = LP(tb(vt, -back * 0.06 * u, 0.22 * u), tb(vb, back * 0.0 * u, -0.12 * u), i / 5);
+            put(press, circle(q[0], q[1], 0.045 * u), { yellow: 1, 'pink.s': 0.3, 'navy.s': 0.2 });
+        }
+        // the coat's front edge and a pocket flap
+        line(press, [tb(p.C, -back * 0.16 * u, 0.1 * u), tb(p.P, -back * 0.12 * u, 0.05 * u)], taper(0.05 * u), { navy: 1, 'pink.s': 0.6 });
+        line(press, [tb(p.P, back * 0.1 * u, 0.02 * u), tb(p.P, -back * 0.36 * u, 0.02 * u)], taper(0.07 * u), COAT_LIT);
+        // near leg, then the coat's front skirt panel over the near thigh
+        leg(hipN, knN, anN, false, p.toeN);
+        // the front of the coat over the near hip, a short panel (the skirt hangs behind)
+        put(press, (g) => smooth(g, [waistF, tb(waistF, back * 0.3 * u, 0.05 * u), add(LP(hipN, knN, 0.35), back * 0.1 * u, 0), add(LP(hipN, knN, 0.4), -back * 0.25 * u, 0.05 * u), tb(waistF, -back * 0.1 * u, 0.3 * u)]), COAT);
+        // head (the cast's Newton head at 165 cast units per head unit: a touch large, as in
+        // illustration, so the face reads)
+        Ph.cam(press, p.H[0], p.H[1], u / 150, () => {
+            press.each((g) => { g.rotate(p.tilt ?? 0); if (f < 0) g.scale(-1, 1); });
+            Cast.newton(press, { headOnly: true, look: p.look ?? [1, 0.2], shut: p.shut, brow: p.brow });
+        });
+        // near arm last (it crosses in front)
+        arm(shN, elN, wrN, false, p.gripN ?? 0.3);
+        return { wrN, wrF, elN, knN, anN, H: p.H, held };
+    }
+
+    // ── smooth choreography ──────────────────────────────────────────────────────────────
+    // A track is [[t, value], …] (numbers or points). Values pass through every key with a
+    // continuous velocity (Hermite, tangents from the neighbours: Catmull-Rom on uneven
+    // times), so motion flows through keys instead of stopping dead at each one. A key
+    // written twice in a row ([t, v], [t2, v]) is a hold.
+    function track(keys, t) {
+        const n = keys.length;
+        if (t <= keys[0][0]) return keys[0][1];
+        if (t >= keys[n - 1][0]) return keys[n - 1][1];
+        let i = 0;
+        while (t >= keys[i + 1][0]) i++;
+        const [t0, a] = keys[i], [t1, b] = keys[i + 1], h = t1 - t0, k = (t - t0) / h;
+        if (typeof a !== 'number' && !Array.isArray(a)) return a; // flags and grips step
+        const prev = keys[Math.max(0, i - 1)], next = keys[Math.min(n - 1, i + 2)];
+        const same = (x, y) => (Array.isArray(x) ? x[0] === y[0] && x[1] === y[1] : x === y);
+        const tan = (pk, qk, v0, v1) => {
+            if (same(v0, v1)) return Array.isArray(v0) ? v0.map(() => 0) : 0; // holds stay still
+            const dt = qk[0] - pk[0] || 1;
+            return Array.isArray(v0) ? v0.map((_, j) => (qk[1][j] - pk[1][j]) / dt) : (qk[1] - pk[1]) / dt;
+        };
+        const m0 = same(a, b) ? tan(keys[i], keys[i], a, a) : same(prev[1], a) ? tan(keys[i], keys[i], a, a) : tan(prev, keys[i + 1], a, b);
+        const m1 = same(a, b) ? m0 : same(b, next[1]) ? tan(keys[i], keys[i], a, a) : tan(keys[i], next, a, b);
+        const k2 = k * k, k3 = k2 * k, h00 = 2 * k3 - 3 * k2 + 1, h10 = k3 - 2 * k2 + k, h01 = -2 * k3 + 3 * k2, h11 = k3 - k2;
+        const f = (p0, p1, v0, v1) => h00 * p0 + h10 * h * v0 + h01 * p1 + h11 * h * v1;
+        return Array.isArray(a) ? a.map((_, j) => f(a[j], b[j], m0[j], m1[j])) : f(a, b, m0, m1);
+    }
+    // feet: planted between steps; a step lifts the foot on an arc and sets it down
+    function foot(steps, x0, t, ground) {
+        let x = x0, y = ground, toe = 0;
+        for (const [a, b, xa, xb, lift] of steps) {
+            if (t >= b) { x = xb; continue; }
+            if (t > a) { const k = Ease.inOut((t - a) / (b - a)); x = L(xa, xb, k); y = ground - lift * Math.sin(Math.PI * k); toe = lift ? -0.25 * Math.sin(Math.PI * k) : 0; }
+            break;
+        }
+        return { p: [x, y], toe };
+    }
+    // a pose from channels: the torso keeps its length (pelvis → chest along the spine angle,
+    // chest → head along the spine plus the neck), so the body never stretches
+    function build(ch, t, u, extra = {}) {
+        const P = track(ch.P, t), sp = track(ch.sp, t), nk = track(ch.nk, t);
+        const C = [P[0] + Math.sin(sp) * 2.4 * u, P[1] - Math.cos(sp) * 2.4 * u];
+        const H = [C[0] + Math.sin(sp + nk) * 0.85 * u, C[1] - Math.cos(sp + nk) * 0.85 * u];
+        const out = { u, P, C, H, tilt: sp * 0.6 + nk };
+        for (const k of Object.keys(ch)) if (!['P', 'sp', 'nk'].includes(k)) out[k] = typeof ch[k] === 'function' ? ch[k](t) : track(ch[k], t);
+        return { ...out, ...extra };
+    }
+
+    return { pose, ik, seg, hand, holdApple, backHand, newton, track, foot, build };
+})();

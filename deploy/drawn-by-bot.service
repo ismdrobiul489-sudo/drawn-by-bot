@@ -1,0 +1,19 @@
+[Unit]
+Description=drawn-by-bot — Telegram bot for code-drawn videos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User/WorkingDirectory to where the repo lives on the VPS.
+User=root
+WorkingDirectory=/opt/drawn-by-bot
+ExecStart=/usr/bin/env node bot/bot.mjs
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.opencode/bin
+# The bot starts OpenCode on demand per job; give renders room to breathe.
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

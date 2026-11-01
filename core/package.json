@@ -1,0 +1,17 @@
+{
+  "name": "drawn-by-code",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Animation drawn by code with Claude: an engine, styles, skills that learn from every render, and experiments",
+  "scripts": {
+    "preview": "node engine/serve.mjs",
+    "new": "node engine/new.mjs",
+    "render": "node engine/render.mjs",
+    "review": "node engine/review.mjs",
+    "mix": "node engine/mix.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}
