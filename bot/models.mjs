@@ -45,7 +45,10 @@ export const PROVIDERS = {
 // a dead model falls back automatically (see resolveWorkingModel) — the
 // job never just dies in silence.
 const probeCache = new Map(); // "provider/model" -> { at, result }
-const PROBE_TIMEOUT_MS = 20000;
+// Per-probe timeout from .env (PROBE_TIMEOUT_SEC, default 45 s) — NVIDIA
+// NIM cold starts can be slow, so 20 s was too tight and hung models read
+// as dead; read at call time so .env changes apply without a code edit.
+const probeTimeoutMs = () => Math.max(1, envInt('PROBE_TIMEOUT_SEC', 45)) * 1000;
 const PROBE_FAIL_TTL_MS = 60000; // failures recover fast; successes use the models TTL
 
 /** Forget all cached probe results (tests, key rotation). */
@@ -72,8 +75,9 @@ export async function probeModel(provider, modelId) {
   if (!key) {
     result = { ok: false, error: `${p.label} API key is missing in .env` };
   } else {
+    const timeoutMs = probeTimeoutMs();
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       const res = await fetch(`${p.baseUrl()}/chat/completions`, {
         method: 'POST',
@@ -90,7 +94,7 @@ export async function probeModel(provider, modelId) {
         result = { ok: false, error: `HTTP ${res.status}${detail ? `: ${String(detail).slice(0, 200)}` : ''}` };
       }
     } catch (e) {
-      result = { ok: false, error: e.name === 'AbortError' ? `no answer within ${PROBE_TIMEOUT_MS / 1000}s` : e.message };
+      result = { ok: false, error: e.name === 'AbortError' ? `no answer within ${timeoutMs / 1000}s` : e.message };
     } finally {
       clearTimeout(timer);
     }

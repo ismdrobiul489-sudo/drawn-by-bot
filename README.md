@@ -185,6 +185,8 @@ every variable: bot token, owner id, Groq/NVIDIA keys and default models,
 Whisper model, Edge TTS voice default, OpenCode binary/model/timeout,
 Telegram size cap, public base URL, store port and retention. The bot is
 **owner-only**: it ignores every Telegram user except `OWNER_TELEGRAM_ID`.
+If jobs keep falling back or failing, run `node scripts/check-models.mjs`
+to see which of your models are alive today.
 
 ## Local dev / tests
 

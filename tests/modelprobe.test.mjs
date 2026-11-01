@@ -11,6 +11,7 @@
 //      with an owner notice, leaves a healthy job alone, and throws loudly
 //      (naming every tried model) when nothing answers
 //  (f) MODEL_PROBE=off skips the network entirely
+//  (g) PROBE_TIMEOUT_SEC drives the probe timeout (hanging model)
 import assert from 'node:assert';
 import { createServer } from 'node:http';
 
@@ -27,6 +28,7 @@ const server = createServer((req, res) => {
       let model = '';
       try { model = JSON.parse(body || '{}').model || ''; } catch { /* no model */ }
       if (who) counts.set(`${who}|${model}`, (counts.get(`${who}|${model}`) || 0) + 1);
+      if (model === 'slow-groq') return; // hangs forever — the probe must time out on its own
       if (!who || dead.has(model)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: `model ${model} not found` } }));
@@ -128,6 +130,14 @@ try {
   assert.equal(hits('groq', 'bad-groq'), beforeHits, 'no request is made while the probe is off');
   delete process.env.MODEL_PROBE;
   console.log('  ✓ (f) MODEL_PROBE=off skips the probe entirely');
+
+  // (g) PROBE_TIMEOUT_SEC from .env drives the probe timeout
+  process.env.PROBE_TIMEOUT_SEC = '1';
+  const slow = await probeModel('groq', 'slow-groq');
+  assert.equal(slow.ok, false);
+  assert.match(slow.error, /no answer within 1s/);
+  delete process.env.PROBE_TIMEOUT_SEC;
+  console.log('  ✓ (g) PROBE_TIMEOUT_SEC sets the probe timeout (hanging model cut at 1 s)');
 } finally {
   server.close();
 }
