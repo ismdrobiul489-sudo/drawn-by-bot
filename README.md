@@ -35,6 +35,9 @@ It is built around three pieces:
 - **Voice** → Groq Whisper transcribes it (transcript + SRT is a deliverable
   on its own), then the scene is built on its timing with your own audio.
 
+Or skip the menu: the commands `/topic`, `/script` and `/voice` jump
+straight into that mode with a fresh draft.
+
 One job runs at a time (FIFO queue). The agent renders a low-res **animatic
 first** and sends it to the chat — you reply in plain language ("make the
 sky warmer", "this part feels empty"), the bot forwards your words into
@@ -192,8 +195,9 @@ npm start       # run the bot (needs a filled .env)
    for the bot token — **never share the token in a chat**: anyone who
    has it controls the bot.
 5. Run the bot once (`bash run.sh` below) and it registers its own
-   command menu — `/start`, `/new`, `/cancel`, `/help` — with Telegram
-   automatically. BotFather's `/setcommands` is **not** needed.
+   command menu — `/start`, `/new`, `/topic`, `/script`, `/voice`,
+   `/cancel`, `/help` — with Telegram automatically. BotFather's
+   `/setcommands` is **not** needed.
 
 ```bash
 git clone https://github.com/ismdrobiul489-sudo/drawn-by-bot.git

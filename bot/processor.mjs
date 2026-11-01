@@ -41,7 +41,7 @@ export function briefText(job) {
 - Final render now: ${j.finalNow ? 'YES' : 'NO — render a low-res animatic first, then STOP and wait for the user feedback that will arrive as a follow-up message in this same session'}
 
 ## User input
-${j.mode === 'voice' ? 'The user supplied an audio file: input-voice (see job folder). Transcribe it with the whisper tool — transcript + SRT only — then build the scene on its timing.' : j.inputText || ''}
+${j.mode === 'voice' ? "The user supplied their voice script as an audio file: input-voice (see job folder). Transcribe it with the whisper tool — the transcript IS the script. Build the scene on its timing and use the user's audio itself as the narration track. Do NOT generate a script and do NOT use TTS." : j.inputText || ''}
 
 ## Files in this job folder
 - brief.md (this file), input.txt (the user's topic/script, text modes)

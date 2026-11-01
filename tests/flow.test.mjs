@@ -6,7 +6,7 @@
 import assert from 'node:assert';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -72,6 +72,7 @@ async function waitFor(pred, what, timeoutMs = 15000) {
 }
 const hasText = frag => () => sent.some(s => (s.text || '').includes(frag));
 const lastKb = frag => sent.filter(s => (s.text || '').includes(frag)).pop()?.reply_markup;
+const countText = frag => sent.filter(s => (s.text || '').includes(frag)).length;
 
 try {
   upd(msg('/start'));
@@ -84,10 +85,13 @@ try {
   assert.deepEqual(sc.params.commands, [
     { command: 'start', description: 'Start the video maker' },
     { command: 'new', description: 'Start a new video job' },
+    { command: 'topic', description: 'New video from a topic' },
+    { command: 'script', description: 'New video from your script' },
+    { command: 'voice', description: 'Make a video from your voice script' },
     { command: 'cancel', description: 'Cancel the current setup' },
     { command: 'help', description: 'How this bot works' },
   ]);
-  console.log('  ✓ setMyCommands registered the 4-command menu at boot');
+  console.log('  ✓ setMyCommands registered the 7-command menu at boot');
 
   // A stranger is ignored:
   pending.push({ update_id: ++updateId, message: { message_id: 1, chat: { id: 99 }, from: { id: 99 }, text: '/start' } });
@@ -134,7 +138,6 @@ try {
   // (c) /cancel mid-setup clears the draft/step: start a script setup,
   // cancel at the content step, then plain text must NOT be taken as the
   // script (it would advance to the provider step) — it hits the fallback.
-  const countText = frag => sent.filter(s => (s.text || '').includes(frag)).length;
   const modesBefore = countText('What will you give');
   upd(msg('/start'));
   await waitFor(() => countText('What will you give') > modesBefore, 'mode keyboard again');
@@ -146,6 +149,40 @@ try {
   await waitFor(hasText('Press /start to begin a new video.'), 'fallback after cancel — old step is gone');
   assert.ok(!hasText('Which provider')() || countText('Which provider') === 1, 'cancelled setup did not advance to provider step');
   console.log('  ✓ /cancel mid-setup clears state (plain text no longer continues the old step)');
+
+  // (d) /script jumps straight into script mode (no menu): the next text
+  // is taken as the script and lands at the provider step, mode 'script'.
+  const draftMode = () => JSON.parse(readFileSync(join(ROOT, 'data', 'state.json'), 'utf8'))['42'].draft.mode;
+  const scriptPrompts = countText('Type the full script');
+  const providersSeen = countText('Which provider');
+  upd(msg('/script'));
+  await waitFor(() => countText('Type the full script') > scriptPrompts, 'script prompt via /script');
+  upd(msg('the quick brown fox narrates this video'));
+  await waitFor(() => countText('Which provider') > providersSeen, 'provider step after /script text');
+  assert.equal(draftMode(), 'script');
+  console.log('  ✓ /script → text lands at provider step with draft mode script');
+
+  // (e) /topic likewise — and it works from mid-setup (provider step of
+  // the /script flow above), starting a fresh draft with mode 'topic'.
+  const topicPrompts = countText('Type your topic');
+  const providersSeen2 = countText('Which provider');
+  upd(msg('/topic'));
+  await waitFor(() => countText('Type your topic') > topicPrompts, 'topic prompt via /topic');
+  upd(msg('why the moon changes shape'));
+  await waitFor(() => countText('Which provider') > providersSeen2, 'provider step after /topic text');
+  assert.equal(draftMode(), 'topic');
+  console.log('  ✓ /topic → text lands at provider step with draft mode topic');
+
+  // (f) /voice jumps into voice mode, and its prompt frames the input as
+  // a voice SCRIPT — the owner's full recorded narration, video built
+  // from his own audio — not a casual "voice note" to transcribe only.
+  upd(msg('/voice'));
+  await waitFor(hasText('Send your voice script'), 'voice prompt via /voice');
+  const voicePrompt = sent.filter(s => (s.text || '').includes('Send your voice script')).pop().text;
+  assert.ok(voicePrompt.includes('your audio stays as the narration'), 'voice prompt: his audio is the narration');
+  assert.ok(voicePrompt.includes('No script writing, no TTS'), 'voice prompt: no script generation, no TTS');
+  assert.equal(draftMode(), 'voice');
+  console.log('  ✓ /voice → prompt asks for a voice script, draft mode voice');
 } finally {
   bot.kill('SIGKILL');
   server.close();

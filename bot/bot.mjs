@@ -94,11 +94,23 @@ function makeHooks(job) {
 async function stepMode(chatId) {
   const cs = chatState(chatId);
   cs.step = 'mode'; cs.draft = {}; saveState();
-  await tg.sendMessage(chatId, 'What will you give? A Topic makes the script + voice for you; a Script makes the voice only; a Voice note is transcribed with Whisper into an SRT.', keyboard([[
+  await tg.sendMessage(chatId, 'What will you give? A Topic makes the script + voice for you; a Script makes the voice only; a Voice script makes the video from your own recorded narration.', keyboard([[
     { text: '💡 Topic', data: 'mode:topic' },
     { text: '📝 Script', data: 'mode:script' },
     { text: '🎙️ Voice', data: 'mode:voice' },
   ]]));
+}
+
+// Shared entry into a mode's content step — used by BOTH the mode
+// buttons (callbacks mode:topic|script|voice) and the /topic, /script,
+// /voice commands, so the two can never drift apart. Always starts a
+// fresh draft with the mode preselected.
+async function startMode(chatId, mode) {
+  const cs = chatState(chatId);
+  cs.draft = { mode }; cs.step = 'content'; saveState();
+  await tg.sendMessage(chatId, mode === 'voice'
+    ? '🎙️ Send your voice script — record the full narration as a voice message or audio file. The video is built from your voice: it is transcribed, scenes are timed to it, and your audio stays as the narration. No script writing, no TTS.'
+    : mode === 'topic' ? '💡 Type your topic and send it (one line is enough).' : '📝 Type the full script and send it.');
 }
 
 async function stepProvider(chatId) {
@@ -220,14 +232,7 @@ async function onCallback(q) {
   if (data.startsWith('perm:') || data.startsWith('q:')) { await relay.handleCallback(chatId, data); return; }
 
   if (data === 'new') { cs.activeJobId = null; await stepMode(chatId); return; }
-  if (data.startsWith('mode:')) {
-    cs.draft.mode = data.slice(5); saveState();
-    cs.step = 'content'; saveState();
-    await tg.sendMessage(chatId, cs.draft.mode === 'voice'
-      ? '🎙️ Send a voice note or an audio file.'
-      : cs.draft.mode === 'topic' ? '💡 Type your topic and send it (one line is enough).' : '📝 Type the full script and send it.');
-    return;
-  }
+  if (data.startsWith('mode:')) { await startMode(chatId, data.slice(5)); return; }
   if (data === 'back:provider') { await stepProvider(chatId); return; }
   if (data.startsWith('prov:')) { cs.draft.provider = data.slice(5); saveState(); await stepModel(chatId); return; }
   if (data === 'models:refresh') { await stepModel(chatId, { refresh: true }); return; }
@@ -271,6 +276,12 @@ async function onMessage(msg) {
 
   if (text === '/start' || text === '/new') { cs.activeJobId = null; await stepMode(chatId); return; }
 
+  // Direct mode commands: jump straight into a mode with a fresh draft —
+  // no ambiguity about whether the coming text is a topic or a script.
+  // Same startMode path as the mode buttons.
+  const modeCmd = { '/topic': 'topic', '/script': 'script', '/voice': 'voice' }[text];
+  if (modeCmd) { cs.activeJobId = null; await startMode(chatId, modeCmd); return; }
+
   if (text === '/cancel') {
     // Cancels only the in-progress SETUP (draft + step). A running or
     // animatic-stage job is NOT touched, and neither are pending
@@ -292,7 +303,7 @@ async function onMessage(msg) {
       'Press /start, say what you will give, then follow the buttons:',
       '• 💡 Topic — you type a topic; the script and the narration voice are made for you.',
       '• 📝 Script — you type the full script; it is narrated as-is.',
-      '• 🎙️ Voice — you send a voice note or audio file; Whisper transcribes it into a transcript + SRT subtitles, and the video is built on its timing.',
+      '• 🎙️ Voice script — you record the full narration yourself and send it as a voice message or audio file. The video is built from your voice: Whisper transcribes it (the transcript IS the script), scenes are timed to it, and your own audio stays as the narration. No script writing, no TTS.',
       '',
       'Everything after that is buttons too: style, aspect, voice. Provider (Groq / NVIDIA) and model are picked per job from the live list of your API key — the ⭐ default comes from .env, and you can switch any job.',
       '',
@@ -300,7 +311,9 @@ async function onMessage(msg) {
       '',
       'Once the preview (animatic) arrives, any plain-text reply is feedback: it goes to the same agent session, which revises and sends a new preview. Press ✅ Final render when you are happy.',
       '',
-      'Commands: /start — begin • /new — new job • /cancel — cancel the current setup • /help — this text',
+      'Shortcuts: /topic, /script and /voice jump straight into that mode — no menu, and no doubt about whether your text is a topic or a script.',
+      '',
+      'Commands: /start — begin • /new — new job • /topic /script /voice — jump straight into a mode • /cancel — cancel the current setup • /help — this text',
     ].join('\n'));
     return;
   }
@@ -362,6 +375,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await tg.setMyCommands([
     { command: 'start', description: 'Start the video maker' },
     { command: 'new', description: 'Start a new video job' },
+    { command: 'topic', description: 'New video from a topic' },
+    { command: 'script', description: 'New video from your script' },
+    { command: 'voice', description: 'Make a video from your voice script' },
     { command: 'cancel', description: 'Cancel the current setup' },
     { command: 'help', description: 'How this bot works' },
   ]);
