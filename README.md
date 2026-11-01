@@ -172,12 +172,33 @@ npm test        # smoke: SRT, model filtering, bitrate math, mock-Telegram flow
 npm start       # run the bot (needs a filled .env)
 ```
 
-## Deploy (VPS)
+## Deploy (VPS) — the whole thing is three commands
 
-`bash deploy/setup.sh`, then follow `deploy/README.md` — BotFather bot,
-keys, **Edge TTS smoke test on the VPS first** (it was blocked from the dev
-VM's network; the TTS is a swappable tool if a network blocks it), systemd
-enable, store link check.
+```bash
+git clone https://github.com/ismdrobiul489-sudo/drawn-by-bot.git
+cd drawn-by-bot
+bash install.sh     # installs EVERYTHING: Node 20+, ffmpeg, Chromium,
+                    # Edge TTS, OpenCode, the engine's npm dependency,
+                    # the systemd unit — and creates .env from the example
+nano .env           # fill in the values listed below
+bash run.sh         # preflight check + start the bot in this terminal
+```
+
+`.env` — what you must fill (everything else has working defaults):
+
+| Variable | What it is |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Token of the NEW bot from @BotFather |
+| `OWNER_TELEGRAM_ID` | Your numeric Telegram id (the bot ignores everyone else) |
+| `GROQ_API_KEY` | Your Groq key (jobs + Whisper) |
+| `NVIDIA_API_KEY` | Your NVIDIA key (jobs + vision QC) |
+| `PUBLIC_BASE_URL` | This server's public URL, so stored-video links open |
+
+Prefer it always-on instead of a terminal? After `install.sh` and `.env`:
+`sudo systemctl enable --now drawn-by-bot`, logs via
+`sudo journalctl -u drawn-by-bot -f`. Full checklist in `deploy/README.md` —
+including the **Edge TTS smoke test on the VPS first** (it was blocked from
+the dev VM's network; the TTS is a swappable tool if a network blocks it).
 
 ## Honest status — what was NOT tested here
 
