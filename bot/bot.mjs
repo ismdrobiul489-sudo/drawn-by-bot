@@ -104,10 +104,15 @@ async function stepMode(chatId) {
 async function stepProvider(chatId) {
   const cs = chatState(chatId);
   cs.step = 'provider'; saveState();
-  await tg.sendMessage(chatId, 'Which provider should run this job?', keyboard([[
-    { text: '⚡ Groq', data: 'prov:groq' },
-    { text: '🟢 NVIDIA', data: 'prov:nvidia' },
-  ]]));
+  // DEFAULT_PROVIDER from .env (any letter case) is shown first, starred.
+  const def = (env('DEFAULT_PROVIDER', 'groq') || 'groq').trim().toLowerCase();
+  const opts = [
+    { text: '⚡ Groq', data: 'prov:groq', key: 'groq' },
+    { text: '🟢 NVIDIA', data: 'prov:nvidia', key: 'nvidia' },
+  ];
+  opts.sort((a, b) => (a.key === def ? -1 : b.key === def ? 1 : 0));
+  const row = opts.map(({ text, data, key }) => ({ text: key === def ? `${text} ⭐` : text, data }));
+  await tg.sendMessage(chatId, 'Which provider should run this job?', keyboard([row]));
 }
 
 async function stepModel(chatId, { refresh = false, page = 0 } = {}) {
