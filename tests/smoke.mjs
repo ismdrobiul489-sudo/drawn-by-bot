@@ -107,4 +107,12 @@ const probeCode = await new Promise(resolve => {
 });
 assert.equal(probeCode, 0, 'model probe test failed');
 passed++;
+
+console.log('— TPM token-limit fallback (child process, mock OpenCode + provider APIs) —');
+const tpmCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/tpmfallback.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(tpmCode, 0, 'TPM fallback test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

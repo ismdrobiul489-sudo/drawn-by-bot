@@ -63,6 +63,13 @@ function makeHooks(job) {
       const m = await tg.sendMessage(job.chatId, text);
       cs.statusMsgId = m.message_id; saveState();
     },
+    async announce(text) {
+      // A standalone message for things the owner must NOT miss (model /
+      // provider switches): status() edits one rolling message in place,
+      // so a notice sent only there is overwritten by the next progress
+      // edit within seconds and effectively never seen.
+      await tg.sendMessage(job.chatId, text);
+    },
     async sendAnimatic(j, render, sheet) {
       const kb = keyboard([[
         { text: '✅ Final render', data: `final:${j.id}` },

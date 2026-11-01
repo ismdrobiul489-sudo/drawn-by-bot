@@ -17,7 +17,7 @@ import { fitForTelegram, MB } from '../media/encode.mjs';
 import { storeFile } from '../media/store.mjs';
 import { qcContactSheet } from '../media/qc-vision.mjs';
 import { qcAudio, summarizeQc } from '../media/qc-audio.mjs';
-import { resolveWorkingModel } from './models.mjs';
+import { resolveWorkingModel, probeModel, PROVIDERS } from './models.mjs';
 import { agentServer } from './agent-server.mjs';
 
 const CORE = join(ROOT, 'core');
@@ -56,6 +56,29 @@ round, including the user's feedback quoted verbatim when it arrives.
 
 function opencodeModel(job) {
   return `${job.provider}/${job.model}`;
+}
+
+// A first turn can die of the provider's free-tier SIZE limit even though
+// the model itself is alive (the 1-token probe passes): Groq free allows
+// 8K tokens/minute while a first turn is ~10.7K tokens. Such errors are
+// classified here — note a TPM error also contains the word "model", so
+// this check must run BEFORE the dead-model guard in processJob.
+const TOKEN_LIMIT_RE = /too large|tokens per minute|\btpm\b|rate.?limit|\b429\b|\b413\b|quota/i;
+export function isTokenLimitError(message) {
+  return TOKEN_LIMIT_RE.test(message || '');
+}
+
+/**
+ * Announce a model/provider switch. hooks.status edits ONE rolling status
+ * message in place (bot.mjs), so a notice sent only there is overwritten
+ * by the next progress edit and effectively never seen — a switch must
+ * ALSO go out as its own message via hooks.announce when available.
+ */
+async function announceModelSwitch(hooks, text) {
+  await hooks.status?.(text);
+  if (hooks.announce) {
+    try { await hooks.announce(text); } catch { /* announcing is best-effort */ }
+  }
 }
 
 /** Which OpenCode driver is active: "serve" (default) or "run" (fallback). */
@@ -165,9 +188,35 @@ export async function ensureWorkingModel(job, hooks = {}) {
     job.provider = res.provider;
     job.model = res.model;
     job.modelFellBack = true;
-    await hooks.status?.(`⚠️ Model ${requested} didn't respond (${bad?.error || 'error'}) — switched to ${res.provider}/${res.model}. Job continues.`);
+    await announceModelSwitch(hooks, `⚠️ Model ${requested} didn't respond (${bad?.error || 'error'}) — switched to ${res.provider}/${res.model}. Job continues.`);
   }
   return res;
+}
+
+/**
+ * Token-limit switch: the current provider's free tier cannot fit this
+ * job's first turn at all, so the job moves to the OTHER provider's .env
+ * default model (probed first — a switch to a dead model is no switch).
+ * Marks job.tpmSwitched so the caller retries the turn exactly once, and
+ * rewrites the brief so the session names the model that will run.
+ * Throws a loud named error when the other provider does not answer.
+ */
+async function switchProviderForTokenLimit(job, hooks, cause) {
+  const fromLabel = PROVIDERS[job.provider]?.label || job.provider;
+  const other = job.provider === 'groq' ? 'nvidia' : 'groq';
+  const otherLabel = PROVIDERS[other]?.label || other;
+  const target = PROVIDERS[other].defaultModel();
+  const probe = await probeModel(other, target);
+  if (!probe.ok) {
+    throw new Error(`${fromLabel} hit its free token limit for this job (${cause.message}) and the fallback ${otherLabel} model ${other}/${target} did not answer either (${probe.error}). The job cannot run right now — wait for the quota window to reset or pick another model.`);
+  }
+  job.provider = other;
+  job.model = target;
+  job.tpmSwitched = true;
+  job.modelFellBack = true;
+  job.modelResolution = { provider: other, model: target, fellBack: true, tried: [], viaTokenLimit: true };
+  await announceModelSwitch(hooks, `⚠️ ${fromLabel} hit its free token limit for this job's size — switched to ${other}/${target}. Job continues.`);
+  writeFileSync(join(job.jobDir, 'brief.md'), briefText(job));
 }
 
 function firstRunMessage(job) {
@@ -270,21 +319,43 @@ export async function processJob(job, hooks) {
   try {
     await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
   } catch (e) {
-    // Mid-flight guard: the probe passed but the first turn still died of
-    // a model problem (not provisioned, 404…) and no fallback has happened
-    // yet — re-resolve once, skipping the model that just failed, and
-    // retry the turn once with the working model.
-    if (job.modelFellBack || !/model|404|not found|not provisioned/i.test(e.message || '')) throw e;
-    const failed = `${job.provider}/${job.model}`;
-    const res = await resolveWorkingModel(job.provider, job.model, () => {}, { skip: [failed] });
-    if (!res.provider) throw e;
-    job.provider = res.provider;
-    job.model = res.model;
-    job.modelFellBack = true;
-    job.modelResolution = res;
-    await hooks.status(`⚠️ Model ${failed} failed during the first turn (${e.message}) — switched to ${res.provider}/${res.model} and retrying once.`);
-    writeFileSync(join(job.jobDir, 'brief.md'), briefText(job));
-    await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+    const msg = e.message || '';
+    if (isTokenLimitError(msg) && !job.tpmSwitched) {
+      // Token-limit guard — checked FIRST, because a TPM error also
+      // contains the word "model" and must never fall into the dead-model
+      // guard below. The provider's whole free tier is too small for
+      // this turn, so retrying ANY model on it is pointless: switch to
+      // the other provider and retry the first turn exactly once. If the
+      // other provider hits the same wall, that failure is final and
+      // loud — no third attempt.
+      const firstLabel = PROVIDERS[job.provider]?.label || job.provider;
+      await switchProviderForTokenLimit(job, hooks, e);
+      try {
+        await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+      } catch (e2) {
+        if (isTokenLimitError(e2.message || '')) {
+          throw new Error(`Token limit on both providers: ${firstLabel} could not fit this job (${msg}) and, after switching, ${job.provider}/${job.model} hit the same limit (${e2.message}). Wait for the quota to reset or shorten the job.`);
+        }
+        throw e2;
+      }
+    } else if (job.modelFellBack || !/model|404|not found|not provisioned/i.test(msg)) {
+      throw e;
+    } else {
+      // Mid-flight guard: the probe passed but the first turn still died
+      // of a model problem (not provisioned, 404…) and no fallback has
+      // happened yet — re-resolve once, skipping the model that just
+      // failed, and retry the turn once with the working model.
+      const failed = `${job.provider}/${job.model}`;
+      const res = await resolveWorkingModel(job.provider, job.model, () => {}, { skip: [failed] });
+      if (!res.provider) throw e;
+      job.provider = res.provider;
+      job.model = res.model;
+      job.modelFellBack = true;
+      job.modelResolution = res;
+      await announceModelSwitch(hooks, `⚠️ Model ${failed} failed during the first turn (${e.message}) — switched to ${res.provider}/${res.model} and retrying once.`);
+      writeFileSync(join(job.jobDir, 'brief.md'), briefText(job));
+      await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+    }
   }
 
   // The voice exists by now (the turn made it): listener-test it before the
