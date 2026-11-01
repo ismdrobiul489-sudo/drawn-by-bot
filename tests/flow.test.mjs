@@ -203,13 +203,17 @@ function tinyWav() {
 // ── Bot child harness ───────────────────────────────────────────────────────
 const REAL_STATE = join(ROOT, 'data', 'state.json');
 const REAL_PENDING = join(ROOT, 'data', 'pending.json');
+const REAL_LOCK = join(ROOT, 'data', 'bot.lock');
 const REAL_MEMORY = join(ROOT, 'data', 'memory');
 let savedRealState = null;
 let savedRealPending = null;
+let savedRealLock = null;
 let savedMemory = null; // { 'preferences.md': string|null, 'index.md': string|null }
 function snapshotRealState() {
   savedRealState = existsSync(REAL_STATE) ? readFileSync(REAL_STATE, 'utf8') : null;
   savedRealPending = existsSync(REAL_PENDING) ? readFileSync(REAL_PENDING, 'utf8') : null;
+  savedRealLock = existsSync(REAL_LOCK) ? readFileSync(REAL_LOCK, 'utf8') : null;
+  rmSync(REAL_LOCK, { force: true }); // a killed child's lock is stale (dead pid) and would be taken over anyway; removing is deterministic
   savedMemory = {};
   for (const f of ['preferences.md', 'index.md']) {
     const p = join(REAL_MEMORY, f);
@@ -224,6 +228,8 @@ function restoreRealState() {
   else writeFileSync(REAL_STATE, savedRealState);
   if (savedRealPending === null) rmSync(REAL_PENDING, { force: true });
   else writeFileSync(REAL_PENDING, savedRealPending);
+  if (savedRealLock === null) rmSync(REAL_LOCK, { force: true });
+  else writeFileSync(REAL_LOCK, savedRealLock);
   if (savedMemory) for (const [f, content] of Object.entries(savedMemory)) {
     const p = join(REAL_MEMORY, f);
     if (content === null) rmSync(p, { force: true });

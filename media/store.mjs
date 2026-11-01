@@ -55,6 +55,18 @@ export function startStoreServer() {
     res.writeHead(200, { 'Content-Type': MIME[extname(name).toLowerCase()] || 'application/octet-stream', 'Content-Length': statSync(file).size });
     import('node:fs').then(fs => fs.createReadStream(file).pipe(res));
   });
+  server.on('error', e => {
+    if (e.code === 'EADDRINUSE') {
+      // The store port is held by another process — in practice another
+      // copy of this bot. That duplicate must be FATAL and loud: in the
+      // 2026-11-01 incident it surfaced only as a "kept alive"
+      // uncaughtException line while two bots corrupted each other.
+      console.error(`[store] Port ${port} is already in use — another copy of the bot is probably running and holding it.`);
+      console.error('[store] Stop the other copy first, then start again. Exiting.');
+      process.exit(1);
+    }
+    console.error('[store] server error:', e.message);
+  });
   server.listen(port, () => console.log(`[store] serving on :${port}`));
   return server;
 }

@@ -114,6 +114,20 @@ answers at all, you get a loud message in chat naming everything tried —
 never silence. Run `node scripts/check-models.mjs` any time to see
 which of your models are alive right now.
 
+**A turn can never end in silence.** Every message gets a "🤔 On it…"
+the moment work starts. The agent's text is streamed live, and when a
+turn settles the bot ALSO fetches the session's stored messages and
+delivers anything the stream missed — if a turn still ends with no
+text, no file and no question pending, you get a plain notice saying
+so. A watchdog (`TURN_STALL_MIN`, default 3 minutes without any agent
+activity; `TURN_MAX_MIN`, default 15 minutes total) stops a turn whose
+model stopped answering and tells you, naming the model. Permission and
+question asks are additionally re-polled from the server every
+`ASK_POLL_SEC` seconds, so they reach you even if the event stream is
+down. And the bot takes a single-instance lock (`data/bot.lock`): a
+second copy started by accident exits immediately with a clear
+message instead of splitting your Telegram updates with the first.
+
 ## Permissions & questions — answered with buttons, never typing
 
 The agent runs on a long-lived `opencode serve` process. Routine

@@ -7,7 +7,7 @@
 // 30 minutes the owner gets ONE reminder nudge.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { envInt, ROOT } from '../lib/env.mjs';
+import { env, envInt, ROOT } from '../lib/env.mjs';
 import { keyboard, rowsOf } from './telegram.mjs';
 
 const DEFAULT_FILE = join(ROOT, 'data', 'pending.json');
@@ -38,6 +38,7 @@ export class AskRelay {
     this.pending = new Map();  // requestId -> entry (persisted)
     this.load();
     this.timer = null;
+    this.pollTimer = null;
     this.offEvent = agent.onEvent ? agent.onEvent(ev => { this.onAgentEvent(ev).catch(() => {}); }) : null;
   }
 
@@ -63,42 +64,84 @@ export class AskRelay {
     if (this.timer) return;
     this.timer = setInterval(() => { this.nudgeStale().catch(() => {}); }, 60000);
     this.timer.unref?.();
+    // Poll backstop (2026-11-01 live lesson): asks were discovered ONLY
+    // via SSE events — when the event stream delivers nothing (dead /
+    // half-open / wrong-instance subscription), an ask never reaches
+    // Telegram and the session waits for an answer forever. Poll the
+    // server's pending lists and surface anything new through the same
+    // path as the SSE handler (deduped by request id in `pending`).
+    const pollSec = Math.max(1, envInt('ASK_POLL_SEC', 7));
+    this.pollTimer = setInterval(() => { this.pollPending().catch(e => console.error('[relay] pending poll failed:', e.message)); }, pollSec * 1000);
+    this.pollTimer.unref?.();
   }
 
   dispose() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = null;
     this.offEvent?.();
+  }
+
+  /** Is an ask (permission or question) pending for this session? The
+   *  conversation watchdog uses this: a turn waiting on the OWNER's tap
+   *  is not a stalled model. */
+  hasPendingFor(sessionId) {
+    for (const e of this.pending.values()) if (e.sessionId === sessionId) return true;
+    return false;
+  }
+
+  /** Backstop sweep: fetch both pending lists and surface any ask for
+   *  an attached session that the event stream never delivered. */
+  async pollPending() {
+    if (!this.sessions.size) return;
+    const [perms, questions] = await Promise.all([
+      this.agent.listPendingPermissions ? this.agent.listPendingPermissions().catch(() => []) : [],
+      this.agent.listPendingQuestions ? this.agent.listPendingQuestions().catch(() => []) : [],
+    ]);
+    for (const p of perms || []) { if (p?.id && !this.pending.has(p.id)) await this.surfacePermission(p).catch(() => {}); }
+    for (const q of questions || []) { if (q?.id && !this.pending.has(q.id)) await this.surfaceQuestion(q).catch(() => {}); }
   }
 
   // ── Event intake ─────────────────────────────────────────────────────────
 
+  /** Surface one permission request (from the SSE handler or the poll
+   *  backstop — identical handling, deduped by request id). */
+  async surfacePermission(p) {
+    const ctx = this.sessions.get(p.sessionID);
+    if (!ctx || this.pending.has(p.id)) return; // not our session, or already shown
+    const entry = {
+      kind: 'perm', id: p.id, sessionId: p.sessionID,
+      chatId: ctx.chatId, jobId: ctx.jobId,
+      permission: p.permission || 'a tool', patterns: p.patterns || [],
+      metadata: p.metadata || {}, askedAt: Date.now(), reminded: false, msgId: null,
+    };
+    this.pending.set(entry.id, entry);
+    this.save();
+    await this.sendPermission(entry);
+  }
+
+  /** Surface one question request (SSE handler or poll backstop). */
+  async surfaceQuestion(p) {
+    const ctx = this.sessions.get(p.sessionID);
+    if (!ctx || this.pending.has(p.id)) return;
+    const entry = {
+      kind: 'ques', id: p.id, sessionId: p.sessionID,
+      chatId: ctx.chatId, jobId: ctx.jobId,
+      questions: p.questions || [], answers: [], index: 0,
+      awaitingText: false, askedAt: Date.now(), reminded: false, msgId: null,
+    };
+    this.pending.set(entry.id, entry);
+    this.save();
+    await this.sendQuestion(entry);
+  }
+
   async onAgentEvent(ev) {
     const p = ev.properties || ev.data || {};
     if (ev.type === 'permission.asked' && p.id) {
-      const ctx = this.sessions.get(p.sessionID);
-      if (!ctx || this.pending.has(p.id)) return; // not our session, or already shown
-      const entry = {
-        kind: 'perm', id: p.id, sessionId: p.sessionID,
-        chatId: ctx.chatId, jobId: ctx.jobId,
-        permission: p.permission || 'a tool', patterns: p.patterns || [],
-        metadata: p.metadata || {}, askedAt: Date.now(), reminded: false, msgId: null,
-      };
-      this.pending.set(entry.id, entry);
-      this.save();
-      await this.sendPermission(entry);
+      await this.surfacePermission(p);
     } else if (ev.type === 'question.asked' && p.id) {
-      const ctx = this.sessions.get(p.sessionID);
-      if (!ctx || this.pending.has(p.id)) return;
-      const entry = {
-        kind: 'ques', id: p.id, sessionId: p.sessionID,
-        chatId: ctx.chatId, jobId: ctx.jobId,
-        questions: p.questions || [], answers: [], index: 0,
-        awaitingText: false, askedAt: Date.now(), reminded: false, msgId: null,
-      };
-      this.pending.set(entry.id, entry);
-      this.save();
-      await this.sendQuestion(entry);
+      await this.surfaceQuestion(p);
     } else if (ev.type === 'permission.replied' && p.requestID) {
       // Answered somewhere else (e.g. a re-sent duplicate) — stop showing it.
       if (this.pending.delete(p.requestID)) this.save();
@@ -227,7 +270,7 @@ export class AskRelay {
     this.pending.delete(entry.id);
     this.save();
     try {
-      await this.agent.replyQuestion(entry.id, entry.answers);
+      await this.agent.replyQuestion(entry.id, entry.answers, entry.sessionId);
     } catch {
       await this.tg.sendMessage(entry.chatId, `⚠️ Your answer to ${entry.jobId} could not be delivered — the question is no longer active on the agent.`).catch(() => {});
     }

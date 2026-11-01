@@ -18,7 +18,7 @@
 //
 // All bot-facing text is in English; the AGENT's own replies follow the
 // owner's language (that is its instruction, not bot text).
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { env, ROOT } from '../lib/env.mjs';
 import { Telegram, keyboard, rowsOf } from './telegram.mjs';
@@ -33,6 +33,45 @@ import { startStoreServer, rotateStore } from '../media/store.mjs';
 const OWNER = Number(env('OWNER_TELEGRAM_ID', '0'));
 const STATE_FILE = join(ROOT, 'data', 'state.json');
 const INBOX = join(ROOT, 'data', 'inbox');
+
+// ── Single-instance lock ────────────────────────────────────────────────────
+// Two copies of this bot on one data dir are catastrophic and were
+// nearly invisible (2026-11-01): they split Telegram updates between
+// their pollers (commands randomly answered, conversation turns torn
+// apart), share data/state.json, and fight over the OpenCode port —
+// while each copy looks "alive". So: an exclusive lock file; a second
+// copy exits loudly BEFORE polling. A lock whose PID is dead is stale
+// (crash / SIGKILL) and is taken over silently.
+const LOCK_FILE = join(ROOT, 'data', 'bot.lock');
+function acquireBotLock() {
+  mkdirSync(join(ROOT, 'data'), { recursive: true });
+  try {
+    const cur = JSON.parse(readFileSync(LOCK_FILE, 'utf8'));
+    if (cur?.pid && cur.pid !== process.pid) {
+      let alive = false;
+      try { process.kill(cur.pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive) {
+        console.error(`[bot] Another copy of this bot is already running (PID ${cur.pid}, started ${cur.startedAt ? new Date(cur.startedAt).toISOString() : 'unknown'}).`);
+        console.error('[bot] Two copies split Telegram updates between them and corrupt each other\'s work — refusing to start.');
+        console.error(`[bot] Stop the other copy first (Ctrl+C in its terminal, or: kill ${cur.pid}), then start again.`);
+        process.exit(1);
+      }
+    }
+  } catch {
+    /* no lock file, or an unreadable/corrupt one → take over */
+  }
+  writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+  const release = () => {
+    try {
+      const cur = JSON.parse(readFileSync(LOCK_FILE, 'utf8'));
+      if (cur?.pid === process.pid) rmSync(LOCK_FILE, { force: true });
+    } catch { /* already gone */ }
+  };
+  process.once('exit', release);
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.once(sig, () => { release(); process.exit(sig === 'SIGINT' ? 130 : 143); });
+  }
+}
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
 function saveState() { mkdirSync(join(ROOT, 'data'), { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
@@ -122,6 +161,16 @@ async function stepModelList(chatId, { refresh = false, page = 0 } = {}) {
 
 // ── Attachments → conversation turns ──────────────────────────────────────
 
+/** Hand text to the conversation; any failure is reported to the owner
+ *  in chat (never only logged — a silent intake is a lost message). */
+async function submitOrReport(chatId, text) {
+  try { await conversation.submit(chatId, text); }
+  catch (e) {
+    console.error('[bot] submit failed:', e.message);
+    await tg.sendMessage(chatId, `❌ I could not hand that to the agent: ${String(e.message || e).slice(0, 300)}`).catch(() => {});
+  }
+}
+
 const safeName = s => String(s || 'file').replace(/[^\w.\-]+/g, '_').slice(-80);
 
 /** Download a Telegram file into data/inbox/; returns its repo-relative path. */
@@ -151,7 +200,7 @@ async function handleVoice(chatId, att, caption) {
   else lines.push('[Voice message — the bot could not transcribe it; the audio file is below, transcribe it with the whisper tool if you need the words.]');
   lines.push(`[Audio file: ${rel} — if this is a voice script for a video, use this file as the narration track.]`);
   if (caption) lines.push(`[Owner's caption:] ${caption}`);
-  await conversation.submit(chatId, lines.join('\n'));
+  await submitOrReport(chatId, lines.join('\n'));
 }
 
 async function handlePhoto(chatId, photo, caption) {
@@ -161,7 +210,7 @@ async function handlePhoto(chatId, photo, caption) {
   const lines = [`[Photo received: ${rel} — you can inspect it with your vision tools if it matters.]`];
   if (caption) lines.push(`[Owner's caption:] ${caption}`);
   else lines.push('[The owner sent this photo without a caption — ask what he wants done with it if it is not obvious.]');
-  await conversation.submit(chatId, lines.join('\n'));
+  await submitOrReport(chatId, lines.join('\n'));
 }
 
 async function handleDocument(chatId, doc, caption) {
@@ -169,7 +218,7 @@ async function handleDocument(chatId, doc, caption) {
   const rel = await saveToInbox(doc.file_id, name);
   const lines = [`[File received: ${rel} (original name: ${doc.file_name || 'file'})]`];
   if (caption) lines.push(`[Owner's caption:] ${caption}`);
-  await conversation.submit(chatId, lines.join('\n'));
+  await submitOrReport(chatId, lines.join('\n'));
 }
 
 // ── Update handling ─────────────────────────────────────────────────────────
@@ -282,9 +331,9 @@ async function onMessage(msg) {
   if (msg.document) { await handleDocument(chatId, msg.document, caption); return; }
 
   // Plain text IS the conversation. Never a form, never "press /start".
-  if (text) {
-    conversation.submit(chatId, text).catch(e => console.error('[bot] submit error:', e.message));
-  }
+  // Not awaited on purpose (a long turn must not block update handling);
+  // submitOrReport carries its own error reporting.
+  if (text) submitOrReport(chatId, text);
 }
 
 async function route(u) {
@@ -301,6 +350,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   process.on('uncaughtException', e => console.error('[bot] uncaughtException (kept alive):', e?.message || e));
 
   if (!OWNER) console.error('[bot] WARNING: OWNER_TELEGRAM_ID not set — the bot will ignore everyone.');
+  acquireBotLock(); // BEFORE the store server, the relay, and polling
   ensureMemoryFiles(); // data/memory/preferences.md + index.md starters
   startStoreServer();
   const removed = rotateStore();

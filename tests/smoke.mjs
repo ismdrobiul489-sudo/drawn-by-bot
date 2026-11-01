@@ -123,4 +123,28 @@ const deathCode = await new Promise(resolve => {
 });
 assert.equal(deathCode, 0, 'server death test failed');
 passed++;
+
+console.log('— Turn watchdog / stall (child process, busy-forever mock OpenCode) —');
+const stallCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/stallwatch.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(stallCode, 0, 'stall watch test failed');
+passed++;
+
+console.log('— Dead event stream recovery (child process, blackholed /event mock) —');
+const sseCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/sserecovery.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(sseCode, 0, 'SSE recovery test failed');
+passed++;
+
+console.log('— Single-instance lock (child processes, real bot boots) —');
+const lockCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/instancelock.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(lockCode, 0, 'instance lock test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

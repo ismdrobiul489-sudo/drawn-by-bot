@@ -23,8 +23,20 @@
 //    failure pointed at a review.md that was never written.)
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { envInt, ROOT } from '../lib/env.mjs';
+import { env, envInt, ROOT } from '../lib/env.mjs';
 import { resolveWorkingModel, probeModel, PROVIDERS } from './models.mjs';
+
+/** Float env (turn-watchdog minutes may be fractional in tests). */
+function envFloat(key, fallback) {
+  const n = parseFloat(env(key, ''), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** Human duration for owner messages: "3 s" under a minute, else minutes. */
+function fmtDur(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 90 ? `${s} s` : `${Math.round(s / 60)} min`;
+}
 
 // ── Agent memory (owner's lifecycle design) ─────────────────────────────────
 // A session is the lifetime of ONE job: it opens with a request, carries
@@ -193,7 +205,7 @@ export class Conversation {
     this.acc = new Map();          // sessionId -> text accumulator
     this.servedChats = new Set();  // chats that have a conversation with us
     this.deathNoticeSent = false;  // ONE restart notice per death episode
-    this.offEvent = agent.onEvent ? agent.onEvent(ev => { try { this.onAgentEvent(ev); } catch { /* contained */ } }) : null;
+    this.offEvent = agent.onEvent ? agent.onEvent(ev => { try { this.onAgentEvent(ev); } catch (e) { console.error('[conversation] event handling error:', e.message); } }) : null;
     this.offDeath = agent.onServerExit ? agent.onServerExit(() => { this.onServerDied().catch(() => {}); }) : null;
   }
 
@@ -207,6 +219,10 @@ export class Conversation {
     if (!sid) return;
     const acc = this.acc.get(sid);
     if (!acc) return;
+    if (!acc.sawEvent) {
+      acc.sawEvent = true;
+      console.log(`[conversation] first agent event for chat ${acc.chatId} (${ev.type})`);
+    }
     if (ev.type === 'message.part.delta' && p.field === 'text' && p.messageID) {
       if (acc.current && acc.current !== p.messageID) this.flushMessage(acc, acc.current);
       acc.current = p.messageID;
@@ -241,7 +257,8 @@ export class Conversation {
   deliver(acc, text) {
     if (acc.gen !== (this.generations.get(acc.chatId) || 0)) return;
     for (const chunk of splitText(text)) {
-      acc.chain = acc.chain.then(() => this.tg.sendMessage(acc.chatId, chunk)).catch(() => {});
+      acc.chain = acc.chain.then(() => this.tg.sendMessage(acc.chatId, chunk))
+        .catch(e => console.error('[conversation] telegram delivery failed:', e.message));
     }
   }
 
@@ -255,7 +272,12 @@ export class Conversation {
    *  new-session model guard) when needed. Returns { created }. */
   async ensureSession(chatId) {
     const cs = this.chatState(chatId);
-    if (cs.sessionId) return { created: false };
+    if (cs.sessionId) {
+      // A resumed session (bot restart): re-teach the driver its
+      // directory, or its events/status stay invisible (scoping).
+      this.agent.trackDirectory?.(cs.sessionId, this.sessionDirectory);
+      return { created: false };
+    }
     const sel = this.selectionOf(cs);
     const target = { provider: sel.provider, model: sel.model };
     const say = t => this.tg.sendMessage(chatId, t).catch(() => {});
@@ -270,6 +292,7 @@ export class Conversation {
       title: 'drawn-by-bot conversation', directory: this.sessionDirectory,
     });
     this.saveState();
+    console.log(`[conversation] session created for chat ${chatId}: ${cs.sessionId} (model ${target.provider}/${target.model})`);
     return { created: true };
   }
 
@@ -348,6 +371,7 @@ export class Conversation {
    *  messages queue (with a short note) and are delivered in order. */
   async submit(chatId, text) {
     this.servedChats.add(chatId);
+    console.log(`[conversation] message received chat=${chatId}: ${JSON.stringify(String(text).slice(0, 40))}`);
     const q = this.queues.get(chatId) || [];
     q.push(text);
     this.queues.set(chatId, q);
@@ -355,7 +379,12 @@ export class Conversation {
       await this.tg.sendMessage(chatId, '📥 Queued — I will pass this to the agent as soon as it finishes what it is doing.').catch(() => {});
       return { queued: true };
     }
-    this.pump(chatId).catch(e => console.error('[conversation] pump error:', e.message));
+    this.pump(chatId).catch(async e => {
+      // No silent paths: a pump-level failure reaches the owner in chat,
+      // never just the console.
+      console.error('[conversation] pump error:', e.message);
+      await this.tg.sendMessage(chatId, `❌ Something went wrong while handling that message (${String(e.message || e).slice(0, 200)}) — please try again.`).catch(() => {});
+    });
     return { queued: false };
   }
 
@@ -367,6 +396,9 @@ export class Conversation {
         const q = this.queues.get(chatId) || [];
         const text = q.shift();
         if (text === undefined) break;
+        // Turn-start acknowledgement: the owner always sees the bot took
+        // the job, even when the agent then works silently for a while.
+        await this.tg.sendMessage(chatId, '🤔 On it…').catch(() => {});
         const outcome = await this.runTurn(chatId, text);
         if (outcome?.claimWithoutDelivery) {
           // ONE automatic nudge per turn chain — never a loop.
@@ -380,6 +412,75 @@ export class Conversation {
 
   // ── One turn, with guards ───────────────────────────────────────────────
 
+  /**
+   * Await one prompt attempt under the turn watchdog:
+   *  - no agent activity for TURN_STALL_MIN minutes (default 3) ⇒ the
+   *    model stopped answering;
+   *  - TURN_MAX_MIN minutes total (default 15) ⇒ absolute cap.
+   * Either trip aborts the session turn, fails the waiter immediately,
+   * and throws an error flagged .watchdog ('stall' | 'cap') that the
+   * caller reports in chat, naming the model. While the relay holds a
+   * pending ask for the session, the turn is waiting on the OWNER's
+   * tap, not the model — the stall clock is held open (the relay's own
+   * 30-minute reminder covers an unanswered ask).
+   */
+  async awaitPrompt(chatId, sessionId, promptPromise, sel) {
+    const stallMs = Math.max(250, envFloat('TURN_STALL_MIN', 3) * 60000);
+    const maxMs = Math.max(stallMs, envFloat('TURN_MAX_MIN', 15) * 60000);
+    const startedAt = Date.now();
+    let lastAct = startedAt;
+    const outcome = await new Promise(resolve => {
+      let done = false;
+      const finish = v => { if (!done) { done = true; clearInterval(timer); resolve(v); } };
+      promptPromise.then(() => finish({ ok: true }), err => finish({ ok: false, err }));
+      const checkMs = Math.max(50, Math.min(1000, Math.floor(Math.min(stallMs, maxMs) / 10)));
+      const timer = setInterval(() => {
+        const act = this.agent.lastActivityAt?.(sessionId) || 0;
+        if (act > lastAct) lastAct = act;
+        if (this.relay?.hasPendingFor?.(sessionId)) lastAct = Date.now();
+        const now = Date.now();
+        const idleFor = now - lastAct;
+        const elapsed = now - startedAt;
+        if (elapsed < maxMs && idleFor < stallMs) return;
+        const kind = elapsed >= maxMs ? 'cap' : 'stall';
+        const err = new Error(kind === 'cap'
+          ? `turn still running after ${fmtDur(elapsed)} (cap ${fmtDur(maxMs)})`
+          : `no agent activity for ${fmtDur(idleFor)} (stall limit ${fmtDur(stallMs)})`);
+        err.watchdog = kind;
+        console.log(`[conversation] watchdog tripped (${kind}) chat=${chatId} session=${sessionId} model=${sel.provider}/${sel.model} idle=${Math.round(idleFor / 1000)}s elapsed=${Math.round(elapsed / 1000)}s`);
+        this.agent.abort(sessionId).catch(() => {});
+        this.agent.failTurn?.(sessionId, err);
+        finish({ ok: false, err });
+      }, checkMs);
+      timer.unref?.();
+    });
+    if (!outcome.ok) throw outcome.err;
+  }
+
+  /** Settle-time text recovery (2026-11-01 live lesson): streamed SSE
+   *  deltas were the ONLY path for assistant text, so any turn whose
+   *  events never arrived (dead/half-open stream, wrong-instance
+   *  subscription) ended "ok" with an empty accumulator — silence. At
+   *  settle, fetch the session's stored messages and fold in every
+   *  assistant text from THIS turn that was not already streamed
+   *  (dedupe by messageID against the accumulator). Returns the count. */
+  async recoverMissedText(chatId, sessionId, acc, turnStartMs) {
+    if (!this.agent.sessionMessages) return 0;
+    const msgs = await this.agent.sessionMessages(sessionId).catch(() => null);
+    if (!msgs) return 0;
+    let recovered = 0;
+    for (const m of msgs) {
+      if (m.role !== 'assistant' || !m.text?.trim()) continue;
+      if (m.created && m.created < turnStartMs - 2000) continue; // earlier turns' history
+      if (acc.byMsg.has(m.id)) continue; // already streamed
+      acc.byMsg.set(m.id, m.text);
+      if (!acc.order.includes(m.id)) acc.order.push(m.id);
+      recovered += 1;
+    }
+    if (recovered) console.log(`[conversation] recovered ${recovered} assistant message(s) from the session store for chat ${chatId}`);
+    return recovered;
+  }
+
   async runTurn(chatId, text, { isNudge = false } = {}) {
     const cs = this.chatState(chatId);
     const gen = this.generations.get(chatId) || 0;
@@ -387,13 +488,14 @@ export class Conversation {
     typing.unref?.();
     this.tg.sendChatAction?.(chatId, 'typing');
     const outboxBefore = this.outbox ? this.outbox.arrivedCount : 0;
+    const turnStartMs = Date.now();
     let acc = null;
     try {
       const { created } = await this.ensureSession(chatId);
       const sel = { ...this.selectionOf(cs) };
       this.currentTexts.set(chatId, text);
       this.relay?.attach(cs.sessionId, chatId, 'chat');
-      acc = { chatId, gen, order: [], byMsg: new Map(), flushed: new Set(), current: null, chain: Promise.resolve() };
+      acc = { chatId, gen, order: [], byMsg: new Map(), flushed: new Set(), current: null, chain: Promise.resolve(), sawEvent: false };
       this.acc.set(cs.sessionId, acc);
       const memoryBrief = created && !isNudge ? readMemoryBrief() : '';
       const firstText = created && !isNudge
@@ -405,9 +507,12 @@ export class Conversation {
       let failure = null;
       for (;;) {
         try {
-          await this.agent.prompt(cs.sessionId, attemptText, { providerID: sel.provider, modelID: sel.model });
+          console.log(`[conversation] prompt sent chat=${chatId} session=${cs.sessionId} model=${sel.provider}/${sel.model}${retried ? ' (retry)' : ''}`);
+          await this.awaitPrompt(chatId, cs.sessionId,
+            this.agent.prompt(cs.sessionId, attemptText, { providerID: sel.provider, modelID: sel.model }), sel);
           break;
         } catch (e) {
+          if (e?.watchdog) { failure = e; break; } // watchdog: no guard retry — report it
           if (retried) { failure = e; break; }
           const action = await this.guardAction(chatId, e, sel).catch(ge => ({ failWith: ge }));
           if (!action) { failure = e; break; }
@@ -424,34 +529,60 @@ export class Conversation {
         }
       }
 
-      this.flushAll(acc);
-      await acc.chain; // let streamed messages land before follow-ups
-
       if (failure) {
-        const msg = String(failure.message || failure).slice(0, 700);
-        await this.tg.sendMessage(chatId, `❌ The agent could not finish that: ${msg}`).catch(() => {});
+        console.log(`[conversation] turn finished chat=${chatId} outcome=failure (${String(failure.message || failure).slice(0, 120)})`);
+        if (failure.watchdog) {
+          const notice = failure.watchdog === 'cap'
+            ? `⚠️ The model ${sel.provider} / ${sel.model} was still working after ${fmtDur(envFloat('TURN_MAX_MIN', 15) * 60000)} without finishing, so I stopped that turn. Nothing is stuck — send your message again, or switch the model with /model.`
+            : `⚠️ The model ${sel.provider} / ${sel.model} stopped answering (no activity for ${fmtDur(envFloat('TURN_STALL_MIN', 3) * 60000)}), so I stopped that turn. Nothing is stuck — send your message again, or switch the model with /model.`;
+          await this.tg.sendMessage(chatId, notice).catch(() => {});
+        } else {
+          const msg = String(failure.message || failure).slice(0, 700);
+          await this.tg.sendMessage(chatId, `❌ The agent could not finish that: ${msg}`).catch(() => {});
+        }
         return { ok: false };
       }
+
+      // The waiter settled — recover any assistant text the event
+      // stream missed BEFORE deciding the turn said nothing.
+      const recovered = await this.recoverMissedText(chatId, cs.sessionId, acc, turnStartMs);
+      this.flushAll(acc);
+      await acc.chain; // let streamed + recovered messages land before follow-ups
+      const streamedChars = this.joinedText(acc).length;
+      console.log(`[conversation] waiter settled chat=${chatId} streamed=${streamedChars} chars recovered=${recovered} message(s)`);
 
       this.deathNoticeSent = false; // a healthy turn ends the death episode
 
       if (this.abortFlags.has(chatId)) {
         this.abortFlags.delete(chatId);
+        console.log(`[conversation] turn finished chat=${chatId} outcome=aborted`);
         return { ok: true, aborted: true }; // no claim check on a stopped turn
       }
 
-      if (!isNudge && this.outbox) {
-        await sleep(this.settleMs); // let a just-written send_file request register
-        const arrived = this.outbox.arrivedCount - outboxBefore;
-        if (arrived === 0 && looksLikeDeliveryClaim(this.joinedText(acc))) {
-          return { ok: true, claimWithoutDelivery: true };
-        }
+      let arrived = 0;
+      if (this.outbox) {
+        if (!isNudge) await sleep(this.settleMs); // let a just-written send_file request register
+        arrived = this.outbox.arrivedCount - outboxBefore;
       }
+      if (!isNudge && arrived === 0 && looksLikeDeliveryClaim(this.joinedText(acc))) {
+        console.log(`[conversation] turn finished chat=${chatId} outcome=claim-without-delivery (nudging)`);
+        return { ok: true, claimWithoutDelivery: true };
+      }
+
+      // A turn that ends with no text, no delivery and no pending ask
+      // must never be silence — say so, plainly, once.
+      if (!this.joinedText(acc).trim() && arrived === 0 && !this.relay?.hasPendingFor?.(cs.sessionId)) {
+        console.log(`[conversation] turn finished chat=${chatId} outcome=empty (posting notice)`);
+        await this.tg.sendMessage(chatId, 'ℹ️ That turn finished without any reply from the agent — odd, but nothing is stuck. Try sending that again.').catch(() => {});
+        return { ok: true, empty: true };
+      }
+      console.log(`[conversation] turn finished chat=${chatId} outcome=ok`);
       return { ok: true };
     } catch (e) {
       // ensureSession failures land here (e.g. no working model): say it
       // in plain language, in chat — never a silent dead end.
       const msg = String(e.message || e).slice(0, 700);
+      console.log(`[conversation] turn finished chat=${chatId} outcome=error (${msg.slice(0, 120)})`);
       await this.tg.sendMessage(chatId, `❌ ${msg}`).catch(() => {});
       return { ok: false };
     } finally {

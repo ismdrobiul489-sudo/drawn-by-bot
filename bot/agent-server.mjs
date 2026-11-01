@@ -39,6 +39,28 @@
 //        server process itself runs elsewhere. The conversation session
 //        uses this to live at the REPO ROOT while the server keeps its
 //        core/ cwd (the custom tools resolve media/ from that cwd).
+//   GET  /session/{id}/message         -> [{ info: { id, role, ... },
+//        parts: [{ type: "text", text, messageID, ... }] }] — the
+//        recovery source for assistant text when the event stream
+//        missed it (see Conversation's settle-time fetch).
+//   GET  /global/event                 -> SSE of ALL instances' events,
+//        each block wrapped: { directory, project, payload: <the v1
+//        event> } (plus payload.type "sync" bookkeeping events, which
+//        are not v1 events and are skipped).
+//
+// DIRECTORY SCOPING (root cause of the 2026-11-01 live silence):
+// /event, /session/status, /question and /permission are all scoped to
+// ONE project instance — the one matching the request's ?directory=
+// (the server cwd's instance when omitted). A session created with
+// ?directory=<repo root> is INVISIBLE to the no-directory variants: no
+// deltas, no asks, no idle on /event, and /session/status reports {}
+// while the session is in fact busy. Verified live against 1.19.5 with
+// a mock provider (2026-11-01): the events flow on /global/event and on
+// /event?directory=<dir>; the status shows busy/retry only with
+// ?directory=. This driver therefore (a) ALSO subscribes to
+// /global/event and unwraps payloads (deduped by event id against the
+// plain stream), and (b) merges ?directory= status/list reads for every
+// directory it has created sessions in.
 //
 // One server child process is spawned lazily (cwd = core/, exactly like the
 // `opencode run` driver sees the project) and reused across all jobs.
@@ -69,7 +91,15 @@ export class AgentServer {
     this.waiters = new Map();   // sessionId -> Set<{resolve, reject, timer, cancel}>
     this.progress = new Map();  // sessionId -> onProgress(text) callback
     this.textBuf = new Map();   // sessionId -> recent assistant text
-    this.sseCtl = null;         // AbortController of the event stream
+    this.streamCtl = new Map(); // 'event'|'global' -> current attempt's AbortController
+    this.streamLoops = new Set(); // 'event'|'global' with a live reconnect loop
+    this.streamUp = new Map();  // 'event'|'global' -> bool (connected now)
+    this.sseConnected = false;  // at least one event stream is connected
+    this.lastEventAt = 0;       // last event received on ANY stream (liveness)
+    this.seenEvents = new Set();// recent event ids (cross-stream dedupe)
+    this.activity = new Map();  // sessionId -> last event time (watchdog)
+    this.sessionDirs = new Map(); // sessionId -> directory it lives in
+    this.livenessTimer = null;  // SSE half-open supervisor
     this.deathListeners = new Set(); // fn({code, signal}) on unexpected child exit
   }
 
@@ -95,12 +125,34 @@ export class AgentServer {
   /** Make sure the server is up (spawning it if we manage it) and the event
    *  stream is connected. Safe to call before every operation. */
   async ensure() {
+    this.startLiveness();
     if (await this.healthy()) { this.connectEvents(); await this.waitSse(); return; }
     if (!this.managed) throw new Error(`OpenCode server at ${this.baseUrl} is not reachable.`);
     if (!this.starting) this.starting = this.spawnServer().finally(() => { this.starting = null; });
     await this.starting;
     this.connectEvents();
     await this.waitSse();
+  }
+
+  /** SSE half-open supervisor: a silently dead stream (no data, no
+   *  error — e.g. a proxy that stopped forwarding) leaves reader.read()
+   *  blocked forever and sseConnected stale-true. While any turn waiter
+   *  is active, a stream silent for SSE_STALE_SEC (default 90) is
+   *  aborted and reconnected by its own loop. Every event on any stream
+   *  counts as life. */
+  startLiveness() {
+    if (this.livenessTimer) return;
+    this.livenessTimer = setInterval(() => {
+      if (this.stopped) return;
+      const waitersActive = [...this.waiters.values()].some(s => s.size);
+      if (!waitersActive) return;
+      const staleMs = envInt('SSE_STALE_SEC', 90) * 1000;
+      if (Date.now() - (this.lastEventAt || 0) <= staleMs) return;
+      console.log(`[agent-server] event streams silent for >${envInt('SSE_STALE_SEC', 90)}s during an active turn — forcing reconnect`);
+      this.lastEventAt = Date.now(); // don't re-trip while reconnecting
+      for (const ctl of this.streamCtl.values()) { try { ctl.abort(); } catch { /* loop reconnects */ } }
+    }, 5000);
+    this.livenessTimer.unref?.();
   }
 
   /** Bounded wait for the SSE stream to (re)connect. A prompt sent while
@@ -144,15 +196,35 @@ export class AgentServer {
   }
 
   connectEvents() {
-    if (this.sseCtl || this.stopped) return;
-    const ctl = new AbortController();
-    this.sseCtl = ctl;
+    this.connectStream('event');
+    this.connectStream('global');
+  }
+
+  /** One SSE subscription with its own reconnect loop. Two streams are
+   *  kept: the plain /event (scoped to the server cwd's instance — the
+   *  only one the test fakes implement) and /global/event (every
+   *  instance, wrapped in { directory, payload }). Events are deduped
+   *  by id across both, so an event visible on both arrives once. */
+  connectStream(kind) {
+    if (this.streamLoops.has(kind) || this.stopped) return;
+    this.streamLoops.add(kind);
+    const path = kind === 'global' ? '/global/event' : '/event';
     (async () => {
       while (!this.stopped) {
+        // Fresh controller per attempt: the liveness supervisor aborts
+        // the CURRENT one to force a reconnect, and the next attempt
+        // must not inherit the aborted signal.
+        const ctl = new AbortController();
+        this.streamCtl.set(kind, ctl);
+        let wasUp = false;
         try {
-          const res = await fetch(`${this.baseUrl}/event`, { signal: ctl.signal, headers: { Accept: 'text/event-stream' } });
+          const res = await fetch(`${this.baseUrl}${path}`, { signal: ctl.signal, headers: { Accept: 'text/event-stream' } });
           if (!res.ok || !res.body) throw new Error(`event stream HTTP ${res.status}`);
+          wasUp = true;
+          this.streamUp.set(kind, true);
           this.sseConnected = true;
+          this.lastEventAt = Date.now();
+          console.log(`[agent-server] event stream connected (${kind})`);
           const reader = res.body.getReader();
           const dec = new TextDecoder();
           let buf = '';
@@ -165,15 +237,36 @@ export class AgentServer {
               const block = buf.slice(0, i); buf = buf.slice(i + 2);
               const line = block.split('\n').find(l => l.startsWith('data:'));
               if (!line) continue;
-              let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+              let raw; try { raw = JSON.parse(line.slice(5).trim()); } catch { continue; }
+              this.lastEventAt = Date.now(); // any bytes = the stream is alive
+              let ev = raw;
+              if (kind === 'global') {
+                ev = raw?.payload;
+                // "sync" payloads are durable-store bookkeeping, not v1
+                // events; anything without a v1 type is not dispatchable.
+                if (!ev || typeof ev.type !== 'string' || ev.type === 'sync') continue;
+              }
+              if (ev.id) {
+                if (this.seenEvents.has(ev.id)) continue; // same event on both streams
+                this.seenEvents.add(ev.id);
+                if (this.seenEvents.size > 2000) { // bounded: drop the oldest half
+                  const keep = [...this.seenEvents].slice(-1000);
+                  this.seenEvents = new Set(keep);
+                }
+              }
               this.dispatch(ev);
             }
           }
         } catch { if (this.stopped) break; }
-        this.sseConnected = false;
-        if (!this.stopped) await sleep(1500); // reconnect backoff
+        this.streamUp.set(kind, false);
+        this.sseConnected = !![...this.streamUp.values()].find(Boolean);
+        if (!this.stopped) {
+          if (wasUp) console.log(`[agent-server] event stream disconnected (${kind}) — reconnecting`);
+          await sleep(1500); // reconnect backoff
+        }
       }
-      this.sseCtl = null;
+      this.streamLoops.delete(kind);
+      this.streamCtl.delete(kind);
     })();
   }
 
@@ -182,6 +275,7 @@ export class AgentServer {
     const props = ev.properties || ev.data || {};
     const sid = props.sessionID;
     if (sid) {
+      this.activity.set(sid, Date.now()); // watchdog liveness per session
       if (ev.type === 'session.idle') this.settleIdle(sid);
       if (ev.type === 'session.error') {
         const msg = props.error?.data?.message || props.error?.name || 'unknown error';
@@ -199,13 +293,64 @@ export class AgentServer {
     for (const fn of this.listeners) { try { fn(ev); } catch { /* listener errors never kill the stream */ } }
   }
 
+  /** Remember which directory a session lives in (its events/status
+   *  are scoped to that project instance on the server). */
+  trackDirectory(sessionId, directory) {
+    if (sessionId && directory) this.sessionDirs.set(sessionId, directory);
+  }
+
+  directoryFor(sessionId) { return this.sessionDirs.get(sessionId); }
+
+  /** Merged session-status map across every instance we know about:
+   *  the no-directory map only covers the server cwd's project, so
+   *  sessions living in another directory are merged in from their own
+   *  ?directory= map (see the directory-scoping note at the top). */
+  async statusMap() {
+    const merged = {};
+    const grab = async suffix => {
+      try {
+        const r = await fetch(`${this.baseUrl}/session/status${suffix}`, { signal: AbortSignal.timeout(2000) });
+        if (r.ok) Object.assign(merged, await r.json());
+      } catch { /* one scope failing must not blind the others */ }
+    };
+    await grab('');
+    const dirs = [...new Set(this.sessionDirs.values())];
+    for (const d of dirs) await grab(`?directory=${encodeURIComponent(d)}`);
+    return merged;
+  }
+
   /** Is the server reporting this session as actively working? */
   async sessionBusy(sessionId) {
-    const r = await fetch(`${this.baseUrl}/session/status`, { signal: AbortSignal.timeout(2000) });
-    if (!r.ok) throw new Error(`session/status HTTP ${r.status}`);
-    const map = await r.json();
+    const map = await this.statusMap();
     const st = map?.[sessionId];
     return !!(st && st.type && st.type !== 'idle');
+  }
+
+  /** Last SSE activity time for a session (0 = none seen). The
+   *  conversation watchdog treats a turn with no activity as stalled. */
+  lastActivityAt(sessionId) { return this.activity.get(sessionId) || 0; }
+
+  /** Fail a session's pending turn waiters right now (watchdog abort). */
+  failTurn(sessionId, err) { this.failWaiters(sessionId, err); }
+
+  /** The session's stored messages, normalised to
+   *  [{ id, role, text, created }] — the recovery source for assistant
+   *  text the event stream missed. Returns null when the read fails. */
+  async sessionMessages(sessionId) {
+    try {
+      const dir = this.sessionDirs.get(sessionId);
+      const suffix = dir ? `?directory=${encodeURIComponent(dir)}` : '';
+      const r = await fetch(`${this.baseUrl}/session/${sessionId}/message${suffix}`, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return null;
+      const list = await r.json();
+      if (!Array.isArray(list)) return null;
+      return list.map(m => ({
+        id: m?.info?.id,
+        role: m?.info?.role,
+        created: m?.info?.time?.created || 0,
+        text: (m?.parts || []).filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join(''),
+      })).filter(m => m.id);
+    } catch { return null; }
   }
 
   addWaiter(sessionId, timeoutMs) {
@@ -247,20 +392,33 @@ export class AgentServer {
   }
 
   async settleIdle(sessionId) {
+    // Snapshot the waiters THIS idle observation applies to, BEFORE the
+    // async status check: a turn that fails fast (e.g. a TPM error) is
+    // retried by the bridge within milliseconds, registering a NEW
+    // waiter for the same session — the previous turn's stray idle must
+    // never resolve it (it would end the retry with an empty result).
+    const atCall = this.waiters.get(sessionId);
+    if (!atCall || !atCall.size) return;
+    const snapshot = [...atCall];
     // Belt-and-braces: ignore a stray idle while the server still reports
     // the session busy (e.g. an idle from a previous turn racing ours).
+    // The check must use the MERGED map — the plain one cannot see a
+    // directory-scoped session's busy state at all.
     try {
-      const r = await fetch(`${this.baseUrl}/session/status`, { signal: AbortSignal.timeout(2000) });
-      if (r.ok) {
-        const map = await r.json();
-        const st = map?.[sessionId];
-        if (st && st.type && st.type !== 'idle') return;
-      }
+      const map = await this.statusMap();
+      const st = map?.[sessionId];
+      if (st && st.type && st.type !== 'idle') return;
     } catch { /* status check is advisory — resolve anyway */ }
-    const set = this.waiters.get(sessionId);
-    if (!set) return;
-    this.waiters.delete(sessionId);
-    for (const w of set) { if (w.timer) clearTimeout(w.timer); if (w.poll) clearInterval(w.poll); w.resolve(); }
+    const current = this.waiters.get(sessionId);
+    if (!current) return;
+    for (const w of snapshot) {
+      if (!current.has(w)) continue; // already settled/failed elsewhere
+      current.delete(w);
+      if (w.timer) clearTimeout(w.timer);
+      if (w.poll) clearInterval(w.poll);
+      w.resolve();
+    }
+    if (!current.size) this.waiters.delete(sessionId);
   }
 
   failWaiters(sessionId, err) {
@@ -292,6 +450,7 @@ export class AgentServer {
     const res = await this.post(path, body);
     const s = await res.json();
     if (!s?.id) throw new Error('OpenCode session create returned no id.');
+    if (directory) this.trackDirectory(s.id, directory);
     return s.id;
   }
 
@@ -309,6 +468,7 @@ export class AgentServer {
    *  are answered, which is exactly the relay's job). */
   async prompt(sessionId, text, { providerID, modelID, agent = 'video-maker' } = {}) {
     await this.ensure();
+    this.activity.set(sessionId, Date.now()); // sending counts as activity
     this.textBuf.set(sessionId, '');
     const timeoutMs = envInt('OPENCODE_TIMEOUT_MIN', 120) * 60000;
     const w = this.addWaiter(sessionId, timeoutMs);
@@ -322,32 +482,48 @@ export class AgentServer {
 
   /** reply: "once" | "always" | "reject" (v1 session permissions endpoint). */
   async replyPermission(sessionId, requestId, reply) {
-    await this.post(`/session/${sessionId}/permissions/${requestId}`, { response: reply });
+    const dir = this.sessionDirs.get(sessionId);
+    const suffix = dir ? `?directory=${encodeURIComponent(dir)}` : '';
+    await this.post(`/session/${sessionId}/permissions/${requestId}${suffix}`, { response: reply });
     return true;
   }
 
   /** answers: one array of chosen labels per question, in order. */
-  async replyQuestion(requestId, answers) {
-    await this.post(`/question/${requestId}/reply`, { answers });
+  async replyQuestion(requestId, answers, sessionId = null) {
+    const dir = sessionId ? this.sessionDirs.get(sessionId) : null;
+    const suffix = dir ? `?directory=${encodeURIComponent(dir)}` : '';
+    await this.post(`/question/${requestId}/reply${suffix}`, { answers });
     return true;
   }
 
-  async rejectQuestion(requestId) {
-    await this.post(`/question/${requestId}/reject`, {});
+  async rejectQuestion(requestId, sessionId = null) {
+    const dir = sessionId ? this.sessionDirs.get(sessionId) : null;
+    const suffix = dir ? `?directory=${encodeURIComponent(dir)}` : '';
+    await this.post(`/question/${requestId}/reject${suffix}`, {});
     return true;
   }
 
-  async listPendingPermissions() {
-    const r = await fetch(`${this.baseUrl}/permission`);
-    if (!r.ok) throw new Error(`OpenCode GET /permission HTTP ${r.status}`);
-    return r.json();
+  /** Pending asks merged across instances (plain + every known
+   *  ?directory= scope), deduped by request id — the plain list alone
+   *  cannot see asks from directory-scoped sessions. */
+  async listMerged(path) {
+    const out = new Map();
+    const grab = async suffix => {
+      const r = await fetch(`${this.baseUrl}${path}${suffix}`);
+      if (!r.ok) throw new Error(`OpenCode GET ${path} HTTP ${r.status}`);
+      const list = await r.json();
+      if (Array.isArray(list)) for (const item of list) if (item?.id) out.set(item.id, item);
+    };
+    await grab('');
+    for (const d of [...new Set(this.sessionDirs.values())]) {
+      try { await grab(`?directory=${encodeURIComponent(d)}`); } catch { /* one scope failing must not hide the others */ }
+    }
+    return [...out.values()];
   }
 
-  async listPendingQuestions() {
-    const r = await fetch(`${this.baseUrl}/question`);
-    if (!r.ok) throw new Error(`OpenCode GET /question HTTP ${r.status}`);
-    return r.json();
-  }
+  async listPendingPermissions() { return this.listMerged('/permission'); }
+
+  async listPendingQuestions() { return this.listMerged('/question'); }
 
   async abort(sessionId) {
     await this.post(`/session/${sessionId}/abort`, {});
@@ -356,7 +532,8 @@ export class AgentServer {
 
   stop() {
     this.stopped = true;
-    this.sseCtl?.abort();
+    if (this.livenessTimer) { clearInterval(this.livenessTimer); this.livenessTimer = null; }
+    for (const ctl of this.streamCtl.values()) { try { ctl.abort(); } catch { /* already gone */ } }
     if (this.child) { try { this.child.kill('SIGTERM'); } catch { /* already dead */ } this.child = null; }
   }
 }
