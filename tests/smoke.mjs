@@ -83,4 +83,12 @@ const relayCode = await new Promise(resolve => {
 });
 assert.equal(relayCode, 0, 'relay test failed');
 passed++;
+
+console.log('— Voice prep / takes / listener QC (child process) —');
+const voiceCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/voice.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(voiceCode, 0, 'voice test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

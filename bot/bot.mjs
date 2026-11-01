@@ -68,13 +68,14 @@ function makeHooks(job) {
         { text: '✅ Final render', data: `final:${j.id}` },
         { text: '🔁 New video', data: 'new' },
       ]]);
-      const caption = `🎞️ Animatic ready — ${j.id}\nStyle: ${j.style} • ${j.aspect} • ${j.provider}/${j.model}\n\nWatch it and reply in plain words — I will revise it and send it again. Happy with it? Press ✅ Final render.`;
+      const caption = `🎞️ Animatic ready — ${j.id}\nStyle: ${j.style} • ${j.aspect} • ${j.provider}/${j.model}${j.voiceQcSummary ? `\n${j.voiceQcSummary}` : ''}\n\nWatch it and reply in plain words — I will revise it and send it again. Happy with it? Press ✅ Final render.`;
       if (sheet) { try { await tg.sendPhoto(job.chatId, sheet, caption, kb); return; } catch { /* fall through */ } }
       try { await tg.sendVideo(job.chatId, render, caption); } catch { await tg.sendMessage(job.chatId, caption, kb); return; }
       await tg.sendMessage(job.chatId, 'How is it? Write your feedback, or:', kb);
     },
     async deliver(j, result) {
       const lines = [`✅ Video ready — ${j.id}`];
+      if (j.voiceQcSummary) lines.push(j.voiceQcSummary);
       if (result.qc) lines.push(result.qc.pass === true ? '🔍 Vision QC: pass' : result.qc.pass === false ? `🔍 Vision QC issues: ${(result.qc.issues || []).join('; ')}` : `🔍 QC: ${(result.qc.issues || []).join('; ')}`);
       if (result.reencoded) lines.push('ℹ️ Sent with a reduced bitrate to fit Telegram; the full master is at the backup link.');
       if (result.storedUrl) lines.push(`💾 Backup (master): ${result.storedUrl}`);

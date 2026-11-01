@@ -16,6 +16,7 @@ import { binaryExists, runStreaming } from '../lib/run.mjs';
 import { fitForTelegram, MB } from '../media/encode.mjs';
 import { storeFile } from '../media/store.mjs';
 import { qcContactSheet } from '../media/qc-vision.mjs';
+import { qcAudio, summarizeQc } from '../media/qc-audio.mjs';
 import { agentServer } from './agent-server.mjs';
 
 const CORE = join(ROOT, 'core');
@@ -168,6 +169,37 @@ export function findSheet(jobDir) {
 }
 
 /**
+ * Listener-test the job's voice (media/qc-audio.mjs) and store the one-line
+ * summary on job.voiceQcSummary for the preview/delivery messages. On a
+ * "fail" verdict the agent gets ONE automatic follow-up turn that names
+ * qc-audio.json and may regenerate ONLY the flagged sections; QC then runs
+ * once more. Voice mode (user audio) has no TTS voice to test — skipped.
+ * QC problems never fail the job itself; they are reported.
+ */
+async function runVoiceQc(job, hooks, onProgress) {
+  if (job.mode === 'voice') return;
+  if (!existsSync(join(job.jobDir, 'voice.mp3'))) return;
+  const qcOpts = { scriptFile: join(job.jobDir, 'script.txt') };
+  try {
+    let qc = await qcAudio(job.jobDir, qcOpts);
+    if (qc.verdict === 'fail') {
+      await hooks.status(`🎙️ ${job.id}: the listener test flagged the voice — asking the agent to regenerate only the flagged sections…`);
+      await runOpenCode(job, [
+        'The automatic listener test on voice.mp3 FAILED. Read qc-audio.json in your job folder for the exact flags (long gaps and/or mismatched words, per section).',
+        'Regenerate ONLY the flagged sections: edit voice-plan.json for those sections only, re-run the tts tool with the plan, then re-render what the brief asked for (animatic or final) plus the contact sheet, and update review.md.',
+        'Do not redo sections that passed, and do not change the script\'s meaning.',
+      ].join(' '), { onProgress, relay: hooks.relay });
+      qc = await qcAudio(job.jobDir, qcOpts);
+    }
+    job.voiceQcSummary = summarizeQc(qc);
+    job.voiceQcPath = join(job.jobDir, 'qc-audio.json');
+  } catch (e) {
+    console.error(`[processor] voice QC did not run for ${job.id}: ${e.message}`);
+    job.voiceQcSummary = `🎙️ Voice QC: did not run (${e.message})`;
+  }
+}
+
+/**
  * Create the job folder + brief, then run the processor.
  * hooks: { status(text), relay, sendAnimatic(job, renderPath, sheetPath),
  *          deliver(job, result) }
@@ -195,6 +227,10 @@ export async function processJob(job, hooks) {
 
   await hooks.status(`🎬 ${job.id} started — mode: ${job.mode}, style: ${job.style}, ${job.aspect}, model: ${job.provider}/${job.model}`);
   await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+
+  // The voice exists by now (the turn made it): listener-test it before the
+  // render is picked, so a QC fix turn's re-render is the one delivered.
+  await runVoiceQc(job, hooks, onProgress);
 
   const render = findRender(job.jobDir);
   if (!render) throw new Error('The OpenCode run finished, but no .mp4 was found in the render/ folder. See review.md.');

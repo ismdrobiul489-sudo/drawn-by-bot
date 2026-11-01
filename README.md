@@ -76,6 +76,38 @@ Set `OPENCODE_DRIVER=run` in `.env` to fall back to the old one-shot
 `opencode run` driver (used automatically if the server cannot start);
 that driver has no button relay.
 
+## Voice quality
+
+The narration is built and checked in three stages — our own pipeline,
+in `media/prep.mjs`, `media/tts.mjs` and `media/qc-audio.mjs`:
+
+1. **Prep.** Before anything is synthesized, the script is cleaned for
+   speech: formatting a voice engine would trip over is stripped, and
+   numbers are written the way they are spoken (amounts, percents,
+   decimals, ranges, years — in English for English text, in Bengali for
+   Bengali text). Cleanup never changes the meaning or the facts.
+2. **Sectioned multipass.** The agent splits the script into sections
+   that follow the content — hook, body, outro — in `voice-plan.json`,
+   and each section is synthesized separately, in order. With
+   `TTS_TAKES=2`, every section gets a second take recorded at a small
+   pitch offset, made at synthesis time.
+3. **Listener test.** After the agent's turn, the bot listens back like a
+   listener would: an ffmpeg silence scan flags abnormally long gaps,
+   and (for audio up to `QC_WHISPER_MAX_SEC`, to protect the Groq free
+   quota) a Whisper re-transcription is word-diffed against the exact
+   text that was synthesized. The better take per section is picked
+   automatically, a one-line summary rides along with the animatic in
+   Telegram ("🎙️ Voice QC: clean" / "…2 long gaps, 1 mismatched word
+   (hook)"), and on a fail the agent is asked to regenerate **only** the
+   flagged sections. The full report lands in the job's `qc-audio.json`.
+
+Honest limits: Edge TTS has **no true emotion control** — the plan's
+`tone` and `emphasis` fields are production notes that shape how the
+agent sections the script; they are not directives the engine obeys.
+The only voice variation available is the pitch offset of a second
+take, applied while synthesizing. Speed always stays 100: recorded
+audio is never time-stretched or re-pitched after the fact.
+
 ## Repo layout
 
 ```
@@ -85,9 +117,12 @@ bot/                   Telegram bot: telegram.mjs (API client), bot.mjs (flow),
                        (one active job), processor.mjs (job pipeline),
                        agent-server.mjs (opencode serve driver),
                        relay.mjs (permission/question → Telegram buttons)
-media/                 tts.mjs (Edge TTS), whisper.mjs (Groq Whisper → SRT),
-                       srt.mjs, qc-vision.mjs (NVIDIA vision QC),
-                       encode.mjs (Telegram fit), store.mjs (public links)
+media/                 tts.mjs (Edge TTS, sectioned plans + takes),
+                       prep.mjs (script cleanup + number verbalization),
+                       qc-audio.mjs (listener-test QC), whisper.mjs
+                       (Groq Whisper → SRT), srt.mjs, qc-vision.mjs
+                       (NVIDIA vision QC), encode.mjs (Telegram fit),
+                       store.mjs (public links)
 .opencode/             our custom agent + tools (tts / whisper / qcvision)
 opencode.json          OpenCode providers (groq + nvidia), permissions
 AGENTS.md              our standing instructions for the agent
@@ -135,7 +170,14 @@ these paths are written and unit/flow-tested but not live-fired:
   but a real agent hitting a real permission prompt mid-job is still
   untested until the first live job on the VPS.
 - Edge TTS synthesis from this machine (its network blocks the endpoint —
-  a known, documented issue; test on the VPS per the checklist).
+  a known, documented issue; test on the VPS per the checklist). The
+  sectioned/takes flow is tested against a mock `edge-tts` binary that
+  writes real mp3s, including the `--pitch` argument on take 2; whether
+  the real service honours that pitch offset exactly as documented is a
+  VPS-stage check.
+- The listener QC's Whisper word check against a live Groq key (the
+  silence scan, take picking, quota guard and report are all covered by
+  tests with the word check disabled or absent).
 - Groq Whisper calls from this code (the same account/endpoint was verified
   separately through the user's existing Groq connector; the key itself
   never leaves the connector, so this code takes its key from `.env`).
