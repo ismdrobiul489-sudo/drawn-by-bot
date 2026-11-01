@@ -99,4 +99,12 @@ const langCode = await new Promise(resolve => {
 });
 assert.equal(langCode, 0, 'lang test failed');
 passed++;
+
+console.log('— Model probe + fallback (child process, mock provider API) —');
+const probeCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/modelprobe.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(probeCode, 0, 'model probe test failed');
+passed++;
 console.log(`\nSMOKE: ${passed} groups passed`);

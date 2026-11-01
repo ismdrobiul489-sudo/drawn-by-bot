@@ -17,6 +17,7 @@ import { fitForTelegram, MB } from '../media/encode.mjs';
 import { storeFile } from '../media/store.mjs';
 import { qcContactSheet } from '../media/qc-vision.mjs';
 import { qcAudio, summarizeQc } from '../media/qc-audio.mjs';
+import { resolveWorkingModel } from './models.mjs';
 import { agentServer } from './agent-server.mjs';
 
 const CORE = join(ROOT, 'core');
@@ -136,6 +137,39 @@ export async function runOpenCode(job, message, hooks = {}) {
   return runOpenCodeServe(job, message, hooks);
 }
 
+/**
+ * Verify the job's chosen model actually answers (1-token probe chain in
+ * bot/models.mjs) and fall back if it is dead: the provider's default model
+ * from .env, then the other provider's default. A fallback updates
+ * job.provider/job.model, marks job.modelFellBack, and is announced via
+ * hooks.status; every step is also kept on job.modelNotices (the job log).
+ * Throws — loudly, naming everything that was tried — when no model
+ * answers at all, so a job never dies silently on a dead model.
+ */
+export async function ensureWorkingModel(job, hooks = {}) {
+  const requested = `${job.provider}/${job.model}`;
+  const notices = [];
+  const notify = text => {
+    notices.push(text);
+    job.modelNotices = notices;
+    return hooks.status ? hooks.status(`⚠️ ${job.id}: ${text}`) : undefined;
+  };
+  const res = await resolveWorkingModel(job.provider, job.model, notify);
+  if (!res.provider) {
+    const detail = res.tried.map(t => `${t.provider}/${t.model} (${t.error || 'no response'})`).join('; ');
+    throw new Error(`No working model found — the job cannot start. Tried: ${detail}. Check the API keys in .env or pick a different model.`);
+  }
+  job.modelResolution = res;
+  if (res.fellBack) {
+    const bad = res.tried.find(t => !t.ok);
+    job.provider = res.provider;
+    job.model = res.model;
+    job.modelFellBack = true;
+    await hooks.status?.(`⚠️ Model ${requested} didn't respond (${bad?.error || 'error'}) — switched to ${res.provider}/${res.model}. Job continues.`);
+  }
+  return res;
+}
+
 function firstRunMessage(job) {
   return [
     `New video job ${job.id}. Work ONLY inside sandbox/${job.folderName}/ in this repo.`,
@@ -226,7 +260,32 @@ export async function processJob(job, hooks) {
   };
 
   await hooks.status(`🎬 ${job.id} started — mode: ${job.mode}, style: ${job.style}, ${job.aspect}, model: ${job.provider}/${job.model}`);
-  await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+
+  // Dead-model guard (both drivers — runOpenCode reads job.provider/model
+  // at call time): probe the chosen model and fall back BEFORE the first
+  // turn. The brief is rewritten when the model changed, so the session
+  // brief names the model that will actually run.
+  await ensureWorkingModel(job, hooks);
+  if (job.modelFellBack) writeFileSync(join(job.jobDir, 'brief.md'), briefText(job));
+  try {
+    await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+  } catch (e) {
+    // Mid-flight guard: the probe passed but the first turn still died of
+    // a model problem (not provisioned, 404…) and no fallback has happened
+    // yet — re-resolve once, skipping the model that just failed, and
+    // retry the turn once with the working model.
+    if (job.modelFellBack || !/model|404|not found|not provisioned/i.test(e.message || '')) throw e;
+    const failed = `${job.provider}/${job.model}`;
+    const res = await resolveWorkingModel(job.provider, job.model, () => {}, { skip: [failed] });
+    if (!res.provider) throw e;
+    job.provider = res.provider;
+    job.model = res.model;
+    job.modelFellBack = true;
+    job.modelResolution = res;
+    await hooks.status(`⚠️ Model ${failed} failed during the first turn (${e.message}) — switched to ${res.provider}/${res.model} and retrying once.`);
+    writeFileSync(join(job.jobDir, 'brief.md'), briefText(job));
+    await runOpenCode(job, firstRunMessage(job), { onProgress, relay: hooks.relay });
+  }
 
   // The voice exists by now (the turn made it): listener-test it before the
   // render is picked, so a QC fix turn's re-render is the one delivered.

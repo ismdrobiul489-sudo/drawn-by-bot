@@ -46,6 +46,15 @@ when needed). No duration limit: long videos are chunked underneath
 (TTS by sentence, Whisper by 10-minute chunks, scenes by SRT segment) and
 delivered by store link when they outgrow Telegram.
 
+**Dead models never fail silently.** The values in `.env` are the
+defaults (the ⭐ provider/model in the bot's steps); the model list
+itself stays dynamic, fetched live from your API key. But a listed model
+can still be dead when called — so before a job starts, the chosen model
+is verified with a 1-token API probe. If it doesn't answer, the job
+automatically falls back to that provider's `.env` default, then to the
+other provider's default, and Telegram tells you which model it switched
+to. If nothing answers, the job fails loudly, naming everything tried.
+
 ## Permissions & questions — answered with buttons, never typing
 
 The agent runs on a long-lived `opencode serve` process (the `serve`
