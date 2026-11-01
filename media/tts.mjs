@@ -180,8 +180,8 @@ export async function finalizeTakes(jobDir, picks = {}) {
   return { voicePath, timingPath, cues };
 }
 
-// Small static fallback (English + Bengali) for when the CLI is not installed
-// yet — the bot still shows a usable voice step during setup.
+// Small static fallback (English + Bengali + Hindi) for when the CLI is not
+// installed yet — the bot still shows a usable voice step during setup.
 export const FALLBACK_VOICES = [
   { shortName: 'en-US-AriaNeural', name: 'Aria', locale: 'en-US', gender: 'Female' },
   { shortName: 'en-US-JennyNeural', name: 'Jenny', locale: 'en-US', gender: 'Female' },
@@ -191,9 +191,11 @@ export const FALLBACK_VOICES = [
   { shortName: 'en-GB-RyanNeural', name: 'Ryan', locale: 'en-GB', gender: 'Male' },
   { shortName: 'bn-BD-NabanitaNeural', name: 'Nabanita', locale: 'bn-BD', gender: 'Female' },
   { shortName: 'bn-BD-PradeepNeural', name: 'Pradeep', locale: 'bn-BD', gender: 'Male' },
+  { shortName: 'hi-IN-SwaraNeural', name: 'Swara', locale: 'hi-IN', gender: 'Female' },
+  { shortName: 'hi-IN-MadhurNeural', name: 'Madhur', locale: 'hi-IN', gender: 'Male' },
 ];
 
-/** Dynamic voice list from `edge-tts --list-voices`, en-* and bn-* only. */
+/** Dynamic voice list from `edge-tts --list-voices`, en-*, bn-* and hi-* only. */
 export async function listVoices() {
   const bin = env('EDGE_TTS_BIN', 'edge-tts');
   if (!binaryExists(bin)) return { voices: FALLBACK_VOICES, dynamic: false };
@@ -202,13 +204,20 @@ export async function listVoices() {
     const voices = [];
     let cur = null;
     for (const line of stdout.split(/\r?\n/)) {
+      // Newer CLIs print a table whose first column is the ShortName and
+      // which has no Locale column — the locale is the ShortName's prefix.
+      const row = line.match(/^([a-z]{2}-[A-Z]{2}-\S+?Neural)\s+(Female|Male)\b/);
+      if (row) { voices.push({ shortName: row[1], gender: row[2], locale: row[1].slice(0, 5) }); cur = null; continue; }
       const name = line.match(/^Name:\s*(\S+)/);
       if (name) { cur = { shortName: name[1] }; voices.push(cur); continue; }
       if (!cur) continue;
+      // The long "Name:" line is prose; the "ShortName:" line that follows
+      // it in the key:value format carries the usable --voice value.
+      const short = line.match(/^ShortName:\s*(\S+)/); if (short) { cur.shortName = short[1]; continue; }
       const loc = line.match(/Locale:\s*(\S+)/); if (loc) cur.locale = loc[1];
       const gen = line.match(/Gender:\s*(\S+)/); if (gen) cur.gender = gen[1];
     }
-    const filtered = voices.filter(v => v.shortName && /^(en|bn)-/.test(v.shortName));
+    const filtered = voices.filter(v => v.shortName && /^(en|bn|hi)-/.test(v.shortName));
     // Friendly display name = the persona part of "en-US-AriaNeural" → "Aria".
     for (const v of filtered) v.name = (v.shortName.split('-').pop() || v.shortName).replace(/Neural$/, '');
     // The CLI's "Name:" is the long id (Microsoft Server Speech ... en-US-AriaNeural);

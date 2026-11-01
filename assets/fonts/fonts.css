@@ -1,0 +1,39 @@
+/* Noto Sans Bengali + Noto Sans Devanagari — SIL Open Font License 1.1
+   (full texts: LICENSE-Noto-Sans-Bengali.txt, LICENSE-Noto-Sans-Devanagari.txt).
+   The style kits in core/ ship Latin-only fonts; these two families cover
+   the Bengali and Devanagari scripts for our own pages/tools.
+
+   Engine scenes do NOT use this stylesheet — the player registers fonts
+   itself via the FontFace API. See load-fonts.js and README.md here. */
+
+@font-face {
+  font-family: 'Noto Sans Bengali';
+  src: url('./noto-sans-bengali-bengali-400-normal.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Noto Sans Bengali';
+  src: url('./noto-sans-bengali-bengali-700-normal.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Noto Sans Devanagari';
+  src: url('./noto-sans-devanagari-devanagari-400-normal.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Noto Sans Devanagari';
+  src: url('./noto-sans-devanagari-devanagari-700-normal.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}

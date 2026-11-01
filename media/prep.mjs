@@ -4,7 +4,8 @@
 //                      (markdown, links, brackets, emoji, stray symbols).
 //   verbalizeNumbers — write numbers the way they are spoken (amounts,
 //                      percents, decimals, ranges, years), in English for
-//                      English text and in Bengali for Bengali text.
+//                      English text, Bengali for Bengali text and Hindi
+//                      for Hindi (Devanagari) text.
 // splitSentences also lives here: it is shared by tts.mjs (chunking) and
 // anything else that needs sentence boundaries.
 
@@ -62,20 +63,62 @@ function bnInt(n) {
 }
 
 const BN_DIGIT_CHARS = '০১২৩৪৫৬৭৮৯';
-const toAsciiDigits = s => s.replace(/[০-৯]/g, d => BN_DIGIT_CHARS.indexOf(d));
+
+// ── Hindi number words ──────────────────────────────────────────────────────
+// Hindi cardinals are irregular up to 99, tabled in full like the Bengali
+// ones; above that the same lakh (१ लाख = 1e5) and crore (१ करोड़ = 1e7)
+// grouping is used.
+
+const HI_WORDS = [
+  'शून्य', 'एक', 'दो', 'तीन', 'चार', 'पाँच', 'छह', 'सात', 'आठ', 'नौ',
+  'दस', 'ग्यारह', 'बारह', 'तेरह', 'चौदह', 'पंद्रह', 'सोलह', 'सत्रह', 'अठारह', 'उन्नीस',
+  'बीस', 'इक्कीस', 'बाईस', 'तेईस', 'चौबीस', 'पच्चीस', 'छब्बीस', 'सत्ताईस', 'अट्ठाईस', 'उनतीस',
+  'तीस', 'इकतीस', 'बत्तीस', 'तैंतीस', 'चौंतीस', 'पैंतीस', 'छत्तीस', 'सैंतीस', 'अड़तीस', 'उनतालीस',
+  'चालीस', 'इकतालीस', 'बयालीस', 'तैंतालीस', 'चवालीस', 'पैंतालीस', 'छियालीस', 'सैंतालीस', 'अड़तालीस', 'उनचास',
+  'पचास', 'इक्यावन', 'बावन', 'तिरपन', 'चौवन', 'पचपन', 'छप्पन', 'सत्तावन', 'अट्ठावन', 'उनसठ',
+  'साठ', 'इकसठ', 'बासठ', 'तिरसठ', 'चौंसठ', 'पैंसठ', 'छियासठ', 'सड़सठ', 'अड़सठ', 'उनहत्तर',
+  'सत्तर', 'इकहत्तर', 'बहत्तर', 'तिहत्तर', 'चौहत्तर', 'पचहत्तर', 'छिहत्तर', 'सतहत्तर', 'अठहत्तर', 'उनासी',
+  'अस्सी', 'इक्यासी', 'बयासी', 'तिरासी', 'चौरासी', 'पचासी', 'छियासी', 'सत्तासी', 'अट्ठासी', 'नवासी',
+  'नब्बे', 'इक्यानवे', 'बानवे', 'तिरानवे', 'चौरानवे', 'पचानवे', 'छियानवे', 'सत्तानवे', 'अट्ठानवे', 'निन्यानवे',
+];
+
+function hiInt(n) {
+  if (n < 100) return HI_WORDS[n];
+  const parts = [];
+  const crore = Math.floor(n / 1e7), lakh = Math.floor((n % 1e7) / 1e5);
+  const thousand = Math.floor((n % 1e5) / 1000), hundred = Math.floor((n % 1000) / 100), rest = n % 100;
+  if (crore) parts.push(hiInt(crore) + ' करोड़');
+  if (lakh) parts.push(HI_WORDS[lakh] + ' लाख');
+  if (thousand) parts.push(HI_WORDS[thousand] + ' हज़ार');
+  if (hundred) parts.push(HI_WORDS[hundred] + ' सौ');
+  if (rest) parts.push(HI_WORDS[rest]);
+  return parts.join(' ');
+}
+
+const DV_DIGIT_CHARS = '०१२३४५६७८९';
+const toAsciiDigits = s => s
+  .replace(/[০-৯]/g, d => BN_DIGIT_CHARS.indexOf(d))
+  .replace(/[०-९]/g, d => DV_DIGIT_CHARS.indexOf(d));
 
 // ── Shared token machinery ──────────────────────────────────────────────────
 
 const CURRENCIES = {
-  '$': { en: ['dollar', 'dollars'], bn: 'ডলার' },
-  '€': { en: ['euro', 'euros'], bn: 'ইউরো' },
-  '£': { en: ['pound', 'pounds'], bn: 'পাউন্ড' },
-  '₹': { en: ['rupee', 'rupees'], bn: 'রুপি' },
-  '৳': { en: ['taka', 'taka'], bn: 'টাকা' },
+  '$': { en: ['dollar', 'dollars'], bn: 'ডলার', hi: ['डॉलर', 'डॉलर'] },
+  '€': { en: ['euro', 'euros'], bn: 'ইউরো', hi: ['यूरो', 'यूरो'] },
+  '£': { en: ['pound', 'pounds'], bn: 'পাউন্ড', hi: ['पाउंड', 'पाउंड'] },
+  '₹': { en: ['rupee', 'rupees'], bn: 'রুপি', hi: ['रुपया', 'रुपये'] },
+  '৳': { en: ['taka', 'taka'], bn: 'টাকা', hi: ['टाका', 'टाका'] },
 };
 
-const DIGITS = String.raw`\d[\d,]*|[০-৯][০-৯,]*`;
-const NUM = String.raw`(?:${DIGITS})(?:\.(?:\d+|[০-৯]+))?`;
+// Spoken joiners per language (leading/trailing spaces included).
+const SPOKEN = {
+  en: { point: ' point ', percent: ' percent', times: ' times', range: ' to ' },
+  bn: { point: ' দশমিক ', percent: ' শতাংশ', times: ' গুণ', range: ' থেকে ' },
+  hi: { point: ' दशमलव ', percent: ' प्रतिशत', times: ' गुना', range: ' से ' },
+};
+
+const DIGITS = String.raw`\d[\d,]*|[০-৯][০-৯,]*|[०-९][०-९,]*`;
+const NUM = String.raw`(?:${DIGITS})(?:\.(?:\d+|[০-৯]+|[०-९]+))?`;
 const RANGE_RE = new RegExp(String.raw`(?:([$€£₹৳])[ ]?)?(${NUM})\s*[-–—]\s*(${NUM})(\s?%|[xX×](?!\p{L}))?`, 'gu');
 const SINGLE_RE = new RegExp(String.raw`(?:([$€£₹৳])[ ]?)?(${NUM})(\s?%|[xX×](?!\p{L}))?`, 'gu');
 
@@ -90,15 +133,21 @@ function sentenceSpans(text) {
   return spans;
 }
 
-/** Bengali digits are always spoken in Bengali; ASCII digits take the
- *  language of the sentence they sit in. */
+/** Bengali digits are always spoken in Bengali and Devanagari digits in
+ *  Hindi; ASCII digits take the language of the sentence they sit in.
+ *  Bengali is checked before Devanagari because the Bengali sentence
+ *  mark '।' (U+0964) itself sits inside the Devanagari block. */
 function langAt(text, spans, idx, rawToken) {
   if (/[০-৯]/.test(rawToken)) return 'bn';
+  if (/[०-९]/.test(rawToken)) return 'hi';
   const span = spans.find(([a, b]) => idx >= a && idx < b) || [0, text.length];
-  return /[\u0980-\u09FF]/.test(text.slice(span[0], span[1])) ? 'bn' : 'en';
+  const s = text.slice(span[0], span[1]);
+  if (/[\u0980-\u09FF]/.test(s)) return 'bn';
+  if (/[\u0900-\u097F]/.test(s)) return 'hi';
+  return 'en';
 }
 
-function intWords(intVal, lang) { return lang === 'bn' ? bnInt(intVal) : enInt(intVal); }
+function intWords(intVal, lang) { return lang === 'bn' ? bnInt(intVal) : lang === 'hi' ? hiInt(intVal) : enInt(intVal); }
 
 function numberWords(numRaw, lang, { currency = null, suffix = null, allowYear = true } = {}) {
   const ascii = toAsciiDigits(numRaw).replace(/,/g, '');
@@ -109,20 +158,21 @@ function numberWords(numRaw, lang, { currency = null, suffix = null, allowYear =
   const intVal = parseInt(intPart, 10);
   let words;
   if (fracPart !== null) {
-    const digitWord = d => (lang === 'bn' ? BN_WORDS[Number(d)] : EN_ONES[Number(d)]);
-    words = intWords(intVal, lang) + (lang === 'bn' ? ' দশমিক ' : ' point ') + [...fracPart].map(digitWord).join(' ');
+    const ones = lang === 'bn' ? BN_WORDS : lang === 'hi' ? HI_WORDS : EN_ONES;
+    const digitWord = d => ones[Number(d)];
+    words = intWords(intVal, lang) + SPOKEN[lang].point + [...fracPart].map(digitWord).join(' ');
   } else if (allowYear && !currency && !suffix && lang === 'en' && !/[,，]/.test(numRaw) && /^\d{4}$/.test(intPart) && intVal >= 1000 && intVal <= 2099) {
     words = enYear(intVal);
   } else {
     words = intWords(intVal, lang);
   }
   if (suffix) {
-    if (suffix.includes('%')) words += lang === 'bn' ? ' শতাংশ' : ' percent';
-    else words += lang === 'bn' ? ' গুণ' : ' times';
+    words += suffix.includes('%') ? SPOKEN[lang].percent : SPOKEN[lang].times;
   }
   if (currency) {
     const c = CURRENCIES[currency];
-    words += ' ' + (lang === 'bn' ? c.bn : (intVal === 1 && fracPart === null ? c.en[0] : c.en[1]));
+    const singular = intVal === 1 && fracPart === null;
+    words += ' ' + (lang === 'bn' ? c.bn : lang === 'hi' ? c.hi[singular ? 0 : 1] : (singular ? c.en[0] : c.en[1]));
   }
   return words;
 }
@@ -147,7 +197,7 @@ export function verbalizeNumbers(text) {
       const wa = numberWords(a, lang, { allowYear: true });
       const wb = numberWords(b, lang, { currency, suffix, allowYear: true });
       if (wa === null || wb === null) return raw;
-      return lang === 'bn' ? `${wa} থেকে ${wb}` : `${wa} to ${wb}`;
+      return wa + SPOKEN[lang].range + wb;
     });
   }
 

@@ -47,6 +47,17 @@ the bot, in plain language, exactly like a chat with Claude. Each job lives in
 - `whisper` — Groq Whisper: audio file → transcript.txt + captions.srt + timing.json
 - `qcvision` — NVIDIA vision QC of a contact sheet → {pass, issues[]}
 
+## Languages on screen
+
+The style kits' fonts are Latin-only. For Bengali or Hindi (Devanagari)
+on-screen text, use this project's own fonts in `assets/fonts/` (Noto
+Sans Bengali / Noto Sans Devanagari, weights 400 + 700, SIL OFL): copy
+the needed .woff2 files into the job folder's `fonts/` subfolder,
+register them in the scene (def `fonts:` entries or `load-fonts.js`),
+and typeset each script's runs in its own family — never in a kit font.
+Details: `assets/fonts/README.md` and the agent instructions in
+`.opencode/agent/video-maker.md`.
+
 ## Feedback
 
 Unless the brief says FINAL, stop after the animatic. The user will reply in

@@ -63,6 +63,39 @@ automatic:
    voice-plan.json for those sections, re-run the tts tool with the
    plan), leave passing sections untouched, and re-render.
 
+## Non-Latin scripts on screen (Bengali / Hindi)
+
+The style kits' fonts are Latin-only — Bengali or Devanagari text drawn
+in a kit font renders as blank boxes. Our own fonts live in the project
+root's `assets/fonts/` (Noto Sans Bengali and Noto Sans Devanagari,
+weights 400 + 700, SIL OFL; see `assets/fonts/README.md` there). When any
+on-screen text in the job contains Bengali script, Devanagari script, or
+mixed runs:
+
+1. Copy the `.woff2` files you need (and optionally `load-fonts.js`)
+   from `assets/fonts/` into the job folder's own `fonts/` subfolder.
+   The engine's server serves `core/` only, so scenes can only reach
+   files inside it — never edit an existing `core/` file to add a font.
+2. Register them with the player, either way:
+   - declare them in the scene def's `fonts:` array, `src` relative to
+     the `core/` root, e.g.
+     `{ family: 'Noto Sans Bengali', src: 'sandbox/<job>/fonts/noto-sans-bengali-bengali-400-normal.woff2', descriptors: { weight: '400' } }`
+     (`ScriptFonts.entries('sandbox/<job>/fonts/')` in
+     `assets/fonts/load-fonts.js` returns this array for both families);
+   - or list `'sandbox/<job>/fonts/load-fonts.js'` in the scene's
+     `uses:` and `await ScriptFonts.load()` inside `setup()`.
+3. Typeset **per text run**: Bengali runs in `'Noto Sans Bengali'`,
+   Devanagari runs in `'Noto Sans Devanagari'` (weight 700 for
+   headings), Latin runs in the style kit's own font. A mixed line is
+   drawn as separate runs, one family each — never set a whole mixed
+   line in a single family, and never typeset these scripts in a kit
+   font.
+
+On the voice side, Edge TTS has Bengali (bn-BD / bn-IN) and Hindi
+(hi-IN) voices and the bot's voice step already offers them; script
+prep speaks numbers in the script's own language, Devanagari digits
+included.
+
 Standing orders: never edit existing files in core/; scenes start from the
 style template; no Math.random/Date in scenes (Motion.rng only); review.mjs
 after every scene version, max 3 repair rounds; animatic first unless the

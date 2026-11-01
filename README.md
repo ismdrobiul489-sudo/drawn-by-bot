@@ -85,7 +85,8 @@ in `media/prep.mjs`, `media/tts.mjs` and `media/qc-audio.mjs`:
    speech: formatting a voice engine would trip over is stripped, and
    numbers are written the way they are spoken (amounts, percents,
    decimals, ranges, years — in English for English text, in Bengali for
-   Bengali text). Cleanup never changes the meaning or the facts.
+   Bengali text, in Hindi for Hindi text). Cleanup never changes the
+   meaning or the facts.
 2. **Sectioned multipass.** The agent splits the script into sections
    that follow the content — hook, body, outro — in `voice-plan.json`,
    and each section is synthesized separately, in order. With
@@ -108,6 +109,26 @@ The only voice variation available is the pitch offset of a second
 take, applied while synthesizing. Speed always stays 100: recorded
 audio is never time-stretched or re-pitched after the fact.
 
+## Languages
+
+- **Narration voices** — the bot's voice step offers whatever the
+  installed Edge TTS CLI reports for English, Bengali (bn-BD / bn-IN)
+  and Hindi (hi-IN); Groq Whisper captioning covers the same languages
+  and many more.
+- **On-screen text** — the style kits' fonts are Latin-only, so the
+  project ships its own SIL OFL fonts in `assets/fonts/`: **Noto Sans
+  Bengali** and **Noto Sans Devanagari** (400 + 700). A scene copies
+  the files it needs into its job folder and typesets Bengali runs in
+  the Bengali family and Devanagari runs in the Devanagari family;
+  Latin runs keep the kit fonts. See `assets/fonts/README.md`.
+- **Script prep** — number verbalization speaks English, Bengali and
+  Hindi, native digits included (Bengali ০-৯, Devanagari ०-९), each
+  with its own lakh/crore grouping where the language uses it.
+
+Honest remainder: any other non-Latin script (Arabic, Cyrillic, CJK…)
+still needs its font added to `assets/fonts/` the same way before a
+scene can show it, and Edge/Whisper coverage varies by language.
+
 ## Repo layout
 
 ```
@@ -123,6 +144,9 @@ media/                 tts.mjs (Edge TTS, sectioned plans + takes),
                        (Groq Whisper → SRT), srt.mjs, qc-vision.mjs
                        (NVIDIA vision QC), encode.mjs (Telegram fit),
                        store.mjs (public links)
+assets/fonts/          our OFL fonts for Bengali + Devanagari on-screen text
+                       (Noto Sans Bengali / Noto Sans Devanagari, fonts.css,
+                       load-fonts.js, licenses, README)
 .opencode/             our custom agent + tools (tts / whisper / qcvision)
 opencode.json          OpenCode providers (groq + nvidia), permissions
 AGENTS.md              our standing instructions for the agent
