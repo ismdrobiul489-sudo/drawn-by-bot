@@ -240,6 +240,7 @@ const briefFor = ({ topic, style, aspect, voiceLine }) => [
   `Style: ${style}`,
   `Aspect: ${aspect}`,
   `Voice: ${voiceLine}`,
+  'Narration language: same as the topic (unless the owner said otherwise).',
   'Make the video end to end. If anything else material is missing, ask in ONE short plain-text question and end your turn — never use the question tool for style, aspect or voice.',
 ].join('\n');
 

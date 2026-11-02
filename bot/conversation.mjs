@@ -21,6 +21,19 @@
 //    nudge turn asks the agent to actually send it or say what went
 //    wrong. (The job-4 lesson: a run "finished", no mp4 existed, and the
 //    failure pointed at a review.md that was never written.)
+//  - Quiet delivery (2026-11-02 live lesson): the agent's intermediate
+//    deliberation ("Let me check the paper.js…") is NEVER forwarded —
+//    models narrate despite instructions (the video-maker.md rule did
+//    not stop a dozen deliberation messages on the first 🎬 run). Only
+//    the turn's FINAL assistant message is delivered, at settle. While
+//    a turn runs, the BOT posts a generic progress ping every
+//    PROGRESS_PING_SEC seconds — a heartbeat with no model content.
+//  - Auto-resume (2026-11-02 live lesson): a video JOB runs as turns on
+//    one session, and a job turn that dies of a stall / transient /
+//    model error is restarted by the bridge itself (RESUME_TEXT, up to
+//    AUTO_RESUME_MAX restarts per job) — the owner is told ONCE, and
+//    never has to resend by hand. A job is active from a 🎬-composed
+//    brief until a final delivery, /new or /cancel.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { env, envInt, ROOT } from '../lib/env.mjs';
@@ -132,10 +145,23 @@ export function looksLikeDeliveryClaim(text) {
 
 export const NUDGE_TEXT = '[System note: you said the file was ready, but nothing was sent to the chat. Please actually send it with the send_file tool, or say plainly what went wrong.]';
 
+// Auto-resume (job turns): the restart prompt the BRIDGE sends on the
+// same session when a job turn dies resumably, and the ONE notice the
+// owner gets per job when the first restart happens.
+export const RESUME_TEXT = 'Continue the video job from where you stopped. First check the job folder and skip any step whose output file already exists; do the next step.';
+export const RESUME_NOTICE = "⚠️ The model stalled — I've restarted the job myself, no need to resend.";
+// A submitted text carrying this marker is a bot-composed job brief
+// (🎬 flow — the TTS path and the voice-script path both compose it via
+// composeMakeBrief in bot.mjs). Its submission OPENS a job.
+const JOB_BRIEF_MARKER = '[New video job — choices already made by the owner';
+// Bot-generated heartbeat while a turn runs (quiet delivery). Contains
+// NO model content and never counts as delivered turn text.
+export const PROGRESS_PING_TEXT = '🎬 Still working on your video…';
+
 const FIRST_TURN_PREFIX = [
   '[Conversation start: this is a fresh conversation with the owner. Sessions here cover ONE job each and end when the finished video is delivered — a fresh chat is normal, never act surprised by it; the memory brief above (when present) is your continuity.',
   'You maintain your own memory files: data/memory/preferences.md (standing preferences — update it the moment he states one) and data/memory/index.md (one line per finished video, appended when you send the final file).',
-  'The owner reaches you only through this chat: reply in his language; style, aspect and voice are collected by the bot\'s buttons before you are briefed — when a brief says the choices are already made, use them and never re-ask them, and NEVER use the question tool for style, aspect or voice; if something else material is missing, ask ONE short plain-text question and end your turn; never narrate your reasoning or tool intentions in chat — act, then report the result briefly; and deliver every file with the send_file tool — never claim a file was sent without calling it.]',
+  'The owner reaches you only through this chat: reply in his language; style, aspect and voice are collected by the bot\'s buttons before you are briefed — when a brief says the choices are already made, use them and never re-ask them, and NEVER use the question tool for style, aspect or voice; if something else material is missing, ask ONE short plain-text question and end your turn; never narrate your reasoning or tool intentions in chat — act, then report the result briefly; and deliver every file with the send_file tool — never claim a file was sent without calling it; the narration language follows the topic\'s language unless he explicitly names one — the language he chats in must never decide it.]',
   '',
 ].join('\n');
 
@@ -222,7 +248,12 @@ export class Conversation {
 
   dispose() { this.offEvent?.(); this.offDeath?.(); }
 
-  // ── Text accumulation + streaming delivery ──────────────────────────────
+  // ── Text accumulation (quiet delivery) ──────────────────────────────────
+  // Streamed text is accumulated per message but NEVER forwarded
+  // mid-turn: models narrate their deliberation despite every
+  // instruction, and the owner received a dozen "Let me check…"
+  // messages for a single job (live 2026-11-02). At settle,
+  // finalTurnText() picks the ONE message the owner sees.
 
   onAgentEvent(ev) {
     const p = ev.properties || ev.data || {};
@@ -235,7 +266,6 @@ export class Conversation {
       console.log(`[conversation] first agent event for chat ${acc.chatId} (${ev.type})`);
     }
     if (ev.type === 'message.part.delta' && p.field === 'text' && p.messageID) {
-      if (acc.current && acc.current !== p.messageID) this.flushMessage(acc, acc.current);
       acc.current = p.messageID;
       if (!acc.order.includes(p.messageID)) acc.order.push(p.messageID);
       acc.byMsg.set(p.messageID, (acc.byMsg.get(p.messageID) || '') + (p.delta || ''));
@@ -251,20 +281,33 @@ export class Conversation {
     }
   }
 
-  flushMessage(acc, mid) {
-    if (acc.flushed.has(mid)) return;
-    acc.flushed.add(mid);
-    const text = (acc.byMsg.get(mid) || '').trim();
-    if (text) this.deliver(acc, text);
+  /** The ONE text a turn delivers under quiet delivery: the LAST
+   *  assistant message with non-empty text at/after the turn's start.
+   *  Every earlier message of the turn — deliberation, progress
+   *  narration, drafts — is dropped, not delivered. The session store
+   *  is the ordering authority when it answered (recoverMissedText
+   *  stashes it on the accumulator); otherwise the accumulator's
+   *  arrival order decides. '' when the turn said nothing deliverable. */
+  finalTurnText(acc, turnStartMs) {
+    const store = acc.storeMsgs;
+    if (Array.isArray(store)) {
+      for (let i = store.length - 1; i >= 0; i--) {
+        const m = store[i];
+        if (m.role !== 'assistant' || !m.text?.trim()) continue;
+        if (m.created && m.created < turnStartMs - 2000) continue; // earlier turns' history
+        return m.text.trim();
+      }
+    }
+    for (let i = acc.order.length - 1; i >= 0; i--) {
+      const t = (acc.byMsg.get(acc.order[i]) || '').trim();
+      if (t) return t;
+    }
+    return '';
   }
 
-  flushAll(acc) {
-    for (const mid of acc.order) this.flushMessage(acc, mid);
-    if (acc.current) this.flushMessage(acc, acc.current);
-  }
-
-  /** Send text to the chat, serialised per accumulator so milestone
-   *  messages keep their order. Suppressed if /new superseded the turn. */
+  /** Send text to the chat, serialised per accumulator so chunks of
+   *  the delivered message keep their order. Suppressed if /new
+   *  superseded the turn. */
   deliver(acc, text) {
     if (acc.gen !== (this.generations.get(acc.chatId) || 0)) return;
     for (const chunk of splitText(text)) {
@@ -313,6 +356,7 @@ export class Conversation {
    *  session. Deliberately does NOT bump the generation: the finishing
    *  turn's own summary text must still be delivered. */
   completeCurrentSession(chatId) {
+    this.endJob(chatId); // a final delivery also ENDS the job
     const cs = this.chatState(chatId);
     if (!cs.sessionId) return false;
     cs.pastSessions = [...(Array.isArray(cs.pastSessions) ? cs.pastSessions : []), { id: cs.sessionId, endedAt: Date.now() }].slice(-50);
@@ -325,6 +369,7 @@ export class Conversation {
   /** /new: drop the session pointer (OpenCode archives it server-side),
    *  clear queued turns, and invalidate in-flight deliveries. */
   async newConversation(chatId) {
+    this.endJob(chatId); // /new ends any active job
     const cs = this.chatState(chatId);
     this.generations.set(chatId, (this.generations.get(chatId) || 0) + 1);
     this.queues.set(chatId, []);
@@ -339,6 +384,7 @@ export class Conversation {
   /** /cancel: abort the running turn if there is one; otherwise clear
    *  the queued messages. Returns 'stopping' | 'cleared' | 'idle'. */
   async cancel(chatId) {
+    this.endJob(chatId); // /cancel ends any active job
     const cs = this.chatState(chatId);
     if (this.running.get(chatId) && cs.sessionId) {
       this.abortFlags.add(chatId);
@@ -352,6 +398,49 @@ export class Conversation {
 
   isRunning(chatId) { return !!this.running.get(chatId); }
   queueLength(chatId) { return (this.queues.get(chatId) || []).length; }
+
+  // ── Job tracking (auto-resume eligibility) ──────────────────────────────
+  // A JOB is the video work opened by a bot-composed brief (submit sees
+  // the marker). It stays active across the job's turns until the
+  // finished video is delivered (final=true → completeCurrentSession),
+  // or the owner sends /new or /cancel. While a job is active, a turn
+  // that dies of a stall or a transient/model error is restarted by the
+  // pump (RESUME_TEXT) instead of being reported — up to
+  // AUTO_RESUME_MAX restarts per job, counted on the persisted state.
+
+  jobOf(chatId) {
+    const job = this.chatState(chatId).job;
+    return job?.active ? job : null;
+  }
+
+  activateJob(chatId) {
+    const cs = this.chatState(chatId);
+    cs.job = { active: true, resumes: 0, noticeSent: false };
+    this.saveState();
+    console.log(`[conversation] job opened for chat ${chatId} (composed brief submitted)`);
+  }
+
+  endJob(chatId) {
+    const cs = this.chatState(chatId);
+    if (!cs.job?.active) return;
+    cs.job = null;
+    this.saveState();
+    console.log(`[conversation] job closed for chat ${chatId}`);
+  }
+
+  /** May this failed turn be auto-resumed? Only inside an active job,
+   *  only for stall / transient / model deaths, never when the owner
+   *  stopped the turn himself (/cancel, /new), and only while the
+   *  per-job resume budget lasts. */
+  jobResumable(chatId, failure) {
+    if (this.abortFlags.has(chatId)) return false; // the owner stopped it — never resurrect it
+    const job = this.jobOf(chatId);
+    if (!job) return false;
+    if ((job.resumes || 0) >= envInt('AUTO_RESUME_MAX', 3)) return false;
+    if (failure?.watchdog) return true;
+    const msg = failure?.message || '';
+    return isTransientError(msg) || isTokenLimitError(msg) || isDeadModelError(msg);
+  }
 
   // ── Server death (amendment A2) ─────────────────────────────────────────
 
@@ -382,6 +471,10 @@ export class Conversation {
    *  messages queue (with a short note) and are delivered in order. */
   async submit(chatId, text) {
     this.servedChats.add(chatId);
+    // A bot-composed job brief (🎬 flow) OPENS a job for this chat; the
+    // job then stays active across turns until it ends (final
+    // delivery, /new, /cancel) — see the job-tracking section below.
+    if (String(text).includes(JOB_BRIEF_MARKER)) this.activateJob(chatId);
     console.log(`[conversation] message received chat=${chatId}: ${JSON.stringify(String(text).slice(0, 40))}`);
     const q = this.queues.get(chatId) || [];
     q.push(text);
@@ -410,10 +503,33 @@ export class Conversation {
         // Turn-start acknowledgement: the owner always sees the bot took
         // the job, even when the agent then works silently for a while.
         await this.tg.sendMessage(chatId, '🤔 On it…').catch(() => {});
-        const outcome = await this.runTurn(chatId, text);
-        if (outcome?.claimWithoutDelivery) {
-          // ONE automatic nudge per turn chain — never a loop.
-          await this.runTurn(chatId, NUDGE_TEXT, { isNudge: true });
+        let outcome = await this.runTurn(chatId, text);
+        for (;;) {
+          if (outcome?.resumable) {
+            // Job auto-resume: the bridge restarts the job turn itself —
+            // the owner never has to resend. ONE notice per job (first
+            // restart); later restarts are logged, not announced. The
+            // budget was already verified by runTurn's jobResumable;
+            // each restart consumes one unit of it here.
+            const job = this.chatState(chatId).job;
+            if (!job?.active) break; // the job ended mid-chain (final delivery) — nothing to resume
+            if (!job.noticeSent) {
+              job.noticeSent = true;
+              await this.tg.sendMessage(chatId, RESUME_NOTICE).catch(() => {});
+            }
+            job.resumes = (job.resumes || 0) + 1;
+            this.saveState();
+            console.log(`[conversation] auto-resume ${job.resumes}/${envInt('AUTO_RESUME_MAX', 3)} for chat ${chatId}`);
+            outcome = await this.runTurn(chatId, RESUME_TEXT, { isResume: true });
+            continue;
+          }
+          if (outcome?.claimWithoutDelivery) {
+            // ONE automatic nudge per turn chain — never a loop (the
+            // nudge turn itself cannot re-trigger this: isNudge).
+            outcome = await this.runTurn(chatId, NUDGE_TEXT, { isNudge: true });
+            continue;
+          }
+          break;
         }
       }
     } finally {
@@ -479,6 +595,7 @@ export class Conversation {
     if (!this.agent.sessionMessages) return 0;
     const msgs = await this.agent.sessionMessages(sessionId).catch(() => null);
     if (!msgs) return 0;
+    acc.storeMsgs = msgs; // finalTurnText's ordering authority at settle
     let recovered = 0;
     for (const m of msgs) {
       if (m.role !== 'assistant' || !m.text?.trim()) continue;
@@ -492,7 +609,7 @@ export class Conversation {
     return recovered;
   }
 
-  async runTurn(chatId, text, { isNudge = false } = {}) {
+  async runTurn(chatId, text, { isNudge = false, isResume = false } = {}) {
     const cs = this.chatState(chatId);
     const gen = this.generations.get(chatId) || 0;
     const typing = setInterval(() => { this.tg.sendChatAction?.(chatId, 'typing'); }, 4000);
@@ -501,13 +618,31 @@ export class Conversation {
     const outboxBefore = this.outbox ? this.outbox.arrivedCount : 0;
     const turnStartMs = Date.now();
     let acc = null;
+    let pingTimer = null;
     try {
       const { created } = await this.ensureSession(chatId);
       const sel = { ...this.selectionOf(cs) };
       this.currentTexts.set(chatId, text);
       this.relay?.attach(cs.sessionId, chatId, 'chat');
-      acc = { chatId, gen, order: [], byMsg: new Map(), flushed: new Set(), current: null, chain: Promise.resolve(), sawEvent: false };
+      acc = { chatId, gen, order: [], byMsg: new Map(), current: null, chain: Promise.resolve(), sawEvent: false };
       this.acc.set(cs.sessionId, acc);
+      // Bot-generated progress pings while the turn runs. Quiet
+      // delivery means NO agent text reaches the owner mid-turn; the
+      // pings — generic, carrying no model content — are the heartbeat
+      // that replaces it. They are not deliveries: they never touch
+      // the accumulator or the turn's delivered-text accounting (a
+      // turn that produces only pings still counts as empty). Held
+      // while the relay waits on the OWNER's tap — then the turn is
+      // waiting on him, not working. PROGRESS_PING_SEC=0 disables.
+      const pingSec = envFloat('PROGRESS_PING_SEC', 90);
+      if (pingSec > 0) {
+        pingTimer = setInterval(() => {
+          if (gen !== (this.generations.get(chatId) || 0)) return; // superseded by /new
+          if (this.relay?.hasPendingFor?.(cs.sessionId)) return; // waiting on the owner, not working
+          this.tg.sendMessage(chatId, PROGRESS_PING_TEXT).catch(() => {});
+        }, pingSec * 1000);
+        pingTimer.unref?.();
+      }
       const memoryBrief = created && !isNudge ? readMemoryBrief() : '';
       const firstText = created && !isNudge
         ? [memoryBrief, FIRST_TURN_PREFIX, text].filter(Boolean).join('\n')
@@ -518,7 +653,7 @@ export class Conversation {
       let failure = null;
       for (;;) {
         try {
-          console.log(`[conversation] prompt sent chat=${chatId} session=${cs.sessionId} model=${sel.provider}/${sel.model}${retried ? ' (retry)' : ''}`);
+          console.log(`[conversation] prompt sent chat=${chatId} session=${cs.sessionId} model=${sel.provider}/${sel.model}${retried ? ' (retry)' : ''}${isResume ? ' (auto-resume)' : ''}`);
           await this.awaitPrompt(chatId, cs.sessionId,
             this.agent.prompt(cs.sessionId, attemptText, { providerID: sel.provider, modelID: sel.model }), sel);
           break;
@@ -542,6 +677,14 @@ export class Conversation {
 
       if (failure) {
         console.log(`[conversation] turn finished chat=${chatId} outcome=failure (${String(failure.message || failure).slice(0, 120)})`);
+        // Job auto-resume: a resumable death inside an active job is
+        // NOT reported — the pump restarts the turn itself. Only when
+        // the job is inactive, the owner stopped the turn, or the
+        // resume budget is spent does the plain failure surface below.
+        if (this.jobResumable(chatId, failure)) {
+          console.log(`[conversation] job turn for chat ${chatId} failed resumably — the pump will auto-resume it`);
+          return { ok: false, resumable: true, failure };
+        }
         if (failure.watchdog) {
           const notice = failure.watchdog === 'cap'
             ? `⚠️ The model ${sel.provider} / ${sel.model} was still working after ${fmtDur(envFloat('TURN_MAX_MIN', 15) * 60000)} without finishing, so I stopped that turn. Nothing is stuck — send your message again, or switch the model with /model.`
@@ -557,10 +700,15 @@ export class Conversation {
       // The waiter settled — recover any assistant text the event
       // stream missed BEFORE deciding the turn said nothing.
       const recovered = await this.recoverMissedText(chatId, cs.sessionId, acc, turnStartMs);
-      this.flushAll(acc);
-      await acc.chain; // let streamed + recovered messages land before follow-ups
-      const streamedChars = this.joinedText(acc).length;
-      console.log(`[conversation] waiter settled chat=${chatId} streamed=${streamedChars} chars recovered=${recovered} message(s)`);
+      // QUIET DELIVERY: of everything the turn produced, ONLY its
+      // final assistant message is delivered. Intermediate
+      // deliberation is dropped here, at the bridge — the model's
+      // instructions not to narrate proved unenforceable (live
+      // 2026-11-02), so the bridge enforces it instead.
+      const finalText = this.finalTurnText(acc, turnStartMs);
+      if (finalText) this.deliver(acc, finalText);
+      await acc.chain; // let the delivered message land before follow-ups
+      console.log(`[conversation] waiter settled chat=${chatId} delivered=${finalText.length} chars (final message only) recovered=${recovered} message(s)`);
 
       this.deathNoticeSent = false; // a healthy turn ends the death episode
 
@@ -580,9 +728,11 @@ export class Conversation {
         return { ok: true, claimWithoutDelivery: true };
       }
 
-      // A turn that ends with no text, no delivery and no pending ask
-      // must never be silence — say so, plainly, once.
-      if (!this.joinedText(acc).trim() && arrived === 0 && !this.relay?.hasPendingFor?.(cs.sessionId)) {
+      // A turn that ends with no delivered text, no file delivery and
+      // no pending ask must never be silence — say so, plainly, once.
+      // (Progress pings do not count: they are the bot's heartbeat,
+      // not the agent's reply.)
+      if (!finalText && arrived === 0 && !this.relay?.hasPendingFor?.(cs.sessionId)) {
         console.log(`[conversation] turn finished chat=${chatId} outcome=empty (posting notice)`);
         await this.tg.sendMessage(chatId, 'ℹ️ That turn finished without any reply from the agent — odd, but nothing is stuck. Try sending that again.').catch(() => {});
         return { ok: true, empty: true };
@@ -598,6 +748,7 @@ export class Conversation {
       return { ok: false };
     } finally {
       clearInterval(typing);
+      if (pingTimer) clearInterval(pingTimer);
     }
   }
 

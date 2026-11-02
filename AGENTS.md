@@ -26,8 +26,12 @@ outside — never edit `core/`. Verify with
 - `bot/conversation.mjs` owns the session: an OpenCode session per chat
   (serve driver, `bot/agent-server.mjs`), session working directory =
   the REPO ROOT, sessionId persisted in `data/state.json` and resumed
-  after restarts. The agent's streamed text is forwarded to Telegram as
-  chat messages. Messages sent while a turn runs are queued and
+  after restarts. **Quiet delivery:** only the agent's FINAL message of
+  a turn is forwarded to Telegram — intermediate deliberation is
+  accumulated silently and dropped at the bridge (models narrate
+  despite instructions; the bridge enforces it). While a turn runs,
+  the bot posts its own generic progress ping every
+  `PROGRESS_PING_SEC`. Messages sent while a turn runs are queued and
   delivered as the next turn.
 - **Session lifecycle (owner's rule): a session is the lifetime of ONE
   job** — it opens with a request, carries that video's revisions, and
@@ -132,6 +136,14 @@ outside — never edit `core/`. Verify with
 - If the OpenCode server process dies, `agent-server` respawns it; the
   bridge re-attaches to the persisted session and the owner gets ONE
   notice: "Agent restarted — our conversation is intact."
+- **Job auto-resume:** a job (opened by a 🎬-composed brief; closed by
+  a final delivery, `/new` or `/cancel`) whose turn dies of a stall or
+  a transient/model error is restarted by the bridge itself — a resume
+  prompt on the same session ("check the job folder, skip steps whose
+  output exists, do the next step"), up to `AUTO_RESUME_MAX` (default
+  3) restarts per job, with ONE owner notice on the first restart.
+  Only when the budget is spent does the plain failure surface. Plain
+  chat turns are never auto-resumed.
 - Every owner-visible failure message is plain language, names the
   cause, and never points to files that don't exist.
 

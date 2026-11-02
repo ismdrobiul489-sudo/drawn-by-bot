@@ -132,6 +132,30 @@ const transientCode = await new Promise(resolve => {
 assert.equal(transientCode, 0, 'transient 503 test failed');
 passed++;
 
+console.log('— Quiet delivery: final message only + progress pings (child process) —');
+const quietCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/quietdelivery.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(quietCode, 0, 'quiet delivery test failed');
+passed++;
+
+console.log('— Narration language rule (child process) —');
+const langruleCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/langrule.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(langruleCode, 0, 'langrule test failed');
+passed++;
+
+console.log('— Job auto-resume (child process, mock OpenCode + provider APIs) —');
+const resumeCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/autoresume.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(resumeCode, 0, 'auto-resume test failed');
+passed++;
+
 console.log('— OpenCode server death + respawn (child process, fake opencode binary) —');
 const deathCode = await new Promise(resolve => {
   const p = spawn('node', ['tests/serverdeath.test.mjs'], { stdio: 'inherit' });

@@ -195,6 +195,7 @@ function composeMakeBrief({ topic, style, aspect, voice }) {
     `Style: ${style}`,
     `Aspect: ${aspect}`,
     `Voice: ${voice === 'own' ? "owner's own recorded narration (voice script)" : 'TTS narration'}`,
+    'Narration language: same as the topic (unless the owner said otherwise).',
     'Make the video end to end. If anything else material is missing, ask in ONE short plain-text question and end your turn — never use the question tool for style, aspect or voice.',
   ].join('\n');
 }
