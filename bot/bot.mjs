@@ -11,6 +11,9 @@
 // The only rigid parts left are commands:
 //   /start  wake + status        /new    fresh conversation
 //   /model  switch the standing model (the ONLY way it changes)
+//   /make   ready-made "Make a video" flow (topic → style → aspect →
+//           voice, all bot-side buttons — the standard questions never
+//           depend on the model's tool-calling)
 //   /cancel stop the running turn (or clear queued messages)
 //   /help   how this works
 // Provider/model are never asked anywhere else: every turn uses the
@@ -159,6 +162,79 @@ async function stepModelList(chatId, { refresh = false, page = 0 } = {}) {
   await tg.sendMessage(chatId, `Select a model (${PROVIDERS[provider].label} — ${models.length} chat models available). It becomes the current model for all following turns:`, keyboard(rows));
 }
 
+// ── 🎬 Make a video — the ready-made flow ─────────────────────────────────
+// The three standard video choices (style / aspect / voice) are collected
+// HERE, deterministically, with bot-side buttons — never by the agent.
+// (2026-11-02: the agent on Ultra fell into a narration loop trying to
+// call OpenCode's question tool and never emitted the call; the owner's
+// ruling: standard questions must be ready-made by the bot.) Until the
+// brief is complete the model is not involved at all; then ONE composed
+// brief turn is submitted to the conversation. State lives in
+// cs.make = { stage, topic?, style?, aspect? }; after the owner picks
+// "record my own voice", cs.expectVoice = { topic, style, aspect } waits
+// for his next voice/audio message (see handleVoice).
+const MAKE_STYLES = [
+  { id: 'paper-cutout', label: '✂️ Paper cutout' },
+  { id: 'line', label: '✒️ Line drawing' },
+  { id: 'risograph', label: '🖨️ Risograph' },
+  { id: '70s-poster', label: '🕺 70s poster' },
+  { id: 'liquid-light', label: '💡 Liquid light' },
+  { id: 'kaleidoscope', label: '🔮 Kaleidoscope' },
+];
+const MAKE_ASPECTS = [
+  { id: '9:16', label: '9:16 (vertical)' },
+  { id: '16:9', label: '16:9 (wide)' },
+  { id: '1:1', label: '1:1 (square)' },
+];
+
+/** The exact brief turn handed to the conversation when the flow ends. */
+function composeMakeBrief({ topic, style, aspect, voice }) {
+  return [
+    '[New video job — choices already made by the owner, do not ask about them again]',
+    `Topic: ${topic}`,
+    `Style: ${style}`,
+    `Aspect: ${aspect}`,
+    `Voice: ${voice === 'own' ? "owner's own recorded narration (voice script)" : 'TTS narration'}`,
+    'Make the video end to end. If anything else material is missing, ask in ONE short plain-text question and end your turn — never use the question tool for style, aspect or voice.',
+  ].join('\n');
+}
+
+async function startMakeFlow(chatId) {
+  const cs = chatState(chatId);
+  cs.make = { stage: 'topic' };
+  cs.expectVoice = null;
+  saveState();
+  await tg.sendMessage(chatId, '🎬 What should the video be about? Send the topic as a message — or send your full script if you have one ready. (/cancel to stop.)');
+}
+
+async function askMakeStyle(chatId) {
+  const btns = MAKE_STYLES.map(s => ({ text: s.label, data: `make:style:${s.id}` }));
+  await tg.sendMessage(chatId, '🎨 Got it. Pick a drawing style:', keyboard(rowsOf(btns, 2)));
+}
+
+async function askMakeAspect(chatId) {
+  const btns = MAKE_ASPECTS.map(a => ({ text: a.label, data: `make:aspect:${a.id}` }));
+  await tg.sendMessage(chatId, '📐 Pick a size:', keyboard(rowsOf(btns, 1)));
+}
+
+async function askMakeVoice(chatId) {
+  const rows = [[
+    { text: '🗣️ Narrate it for me (TTS)', data: 'make:voice:tts' },
+  ], [
+    { text: "🎙️ I'll record my own voice", data: 'make:voice:own' },
+  ]];
+  await tg.sendMessage(chatId, '🔊 Last one — who narrates it?', keyboard(rows));
+}
+
+/** The flow ends: hand the ONE composed brief to the conversation. */
+async function finishMakeFlowTTS(chatId) {
+  const cs = chatState(chatId);
+  const { topic, style, aspect } = cs.make;
+  cs.make = null; saveState();
+  await submitOrReport(chatId, composeMakeBrief({ topic, style, aspect, voice: 'tts' }));
+  await tg.sendMessage(chatId, `✅ Brief sent to the agent: “${topic}” — style: ${style}, aspect: ${aspect}, voice: TTS narration. It's on the job now.`);
+}
+
 // ── Attachments → conversation turns ──────────────────────────────────────
 
 /** Hand text to the conversation; any failure is reported to the owner
@@ -196,6 +272,16 @@ async function handleVoice(chatId, att, caption) {
   let transcript = null;
   try { transcript = await transcribeInboxAudio(abs); } catch (e) { console.error('[bot] inbox transcription failed:', e.message); }
   const lines = [];
+  // A 🎬 flow waiting for his own-voice recording: this message IS the
+  // job's voice script — the composed brief goes first, then the usual
+  // transcript + audio-path lines.
+  const cs = chatState(chatId);
+  if (cs.expectVoice) {
+    const expect = cs.expectVoice;
+    cs.expectVoice = null; saveState();
+    lines.push(composeMakeBrief({ topic: expect.topic, style: expect.style, aspect: expect.aspect, voice: 'own' }));
+    lines.push('[The owner\'s recorded narration for this job follows — transcript and audio file:]');
+  }
   if (transcript) lines.push(`[Voice message, transcript:] ${transcript}`);
   else lines.push('[Voice message — the bot could not transcribe it; the audio file is below, transcribe it with the whisper tool if you need the words.]');
   lines.push(`[Audio file: ${rel} — if this is a voice script for a video, use this file as the narration track.]`);
@@ -233,6 +319,32 @@ async function onCallback(q) {
   // Agent permission / question answers (bot/relay.mjs).
   if (data.startsWith('perm:') || data.startsWith('q:')) { await relay.handleCallback(chatId, data); return; }
 
+  // 🎬 Make-a-video flow buttons.
+  if (data === 'make:start') { await startMakeFlow(chatId); return; }
+  if (data.startsWith('make:')) {
+    if (!cs.make) {
+      await tg.sendMessage(chatId, 'That video setup is no longer open — tap 🎬 Make a video or send /make to start again.');
+      return;
+    }
+    if (data.startsWith('make:style:')) {
+      cs.make.style = data.slice('make:style:'.length); cs.make.stage = 'aspect'; saveState();
+      await askMakeAspect(chatId); return;
+    }
+    if (data.startsWith('make:aspect:')) {
+      cs.make.aspect = data.slice('make:aspect:'.length); cs.make.stage = 'voice'; saveState();
+      await askMakeVoice(chatId); return;
+    }
+    if (data === 'make:voice:tts') { await finishMakeFlowTTS(chatId); return; }
+    if (data === 'make:voice:own') {
+      const { topic, style, aspect } = cs.make;
+      cs.expectVoice = { topic, style, aspect };
+      cs.make = null; saveState();
+      await tg.sendMessage(chatId, `🎙️ Now send your voice message with the full narration — I'll build the video around your recording (topic: “${topic}”, style: ${style}, aspect: ${aspect}).`);
+      return;
+    }
+    return;
+  }
+
   // /model picker callbacks — only reachable inside a /model session the
   // owner started himself with the /model command.
   if (data === 'mpick') { await stepModelPicker(chatId); return; }
@@ -257,7 +369,7 @@ async function onMessage(msg) {
   const caption = msg.caption || '';
 
   if (text === '/start') {
-    cs.step = 'idle'; saveState();
+    cs.step = 'idle'; cs.make = null; cs.expectVoice = null; saveState();
     const sel = selectionOf(cs);
     await tg.sendMessage(chatId, [
       "👋 I'm awake — this is a conversation, not a form. Just talk to me.",
@@ -265,22 +377,33 @@ async function onMessage(msg) {
       `💬 Conversation: ${cs.sessionId ? 'open — we can pick up right where we left off' : 'not started yet — your first message opens one'}`,
       '',
       "Send a topic, a full script, or a voice message with your recorded narration, and I'll make the video here in this chat. If something is unclear I'll ask — answers come as buttons.",
-    ].join('\n'));
+      'Or tap 🎬 Make a video below and I\'ll collect the topic, style, size and voice with ready-made buttons first.',
+    ].join('\n'), keyboard([[{ text: '🎬 Make a video', data: 'make:start' }]]));
     return;
   }
 
   if (text === '/new') {
     await conversation.newConversation(chatId);
-    cs.step = 'idle'; saveState();
+    cs.step = 'idle'; cs.make = null; cs.expectVoice = null; saveState();
     await tg.sendMessage(chatId, '🆕 Fresh conversation started — the old one is archived. Just tell me what to make next.');
     return;
   }
+
+  // /make — the ready-made flow (same as the 🎬 button on /start).
+  if (text === '/make') { await startMakeFlow(chatId); return; }
 
   // /model — the ONLY way the standing provider/model selection changes,
   // and only when the owner explicitly runs it. Nothing else routes here.
   if (text === '/model') { await stepModelPicker(chatId); return; }
 
   if (text === '/cancel') {
+    // A 🎬 flow (or a pending voice-script expectation) is cancelled
+    // bot-side first — it never reached the agent.
+    if (cs.make || cs.expectVoice) {
+      cs.make = null; cs.expectVoice = null; cs.step = 'idle'; saveState();
+      await tg.sendMessage(chatId, '🎬 Video setup cancelled — nothing is being made. Tap 🎬 Make a video or send /make whenever you want one.');
+      return;
+    }
     cs.step = 'idle'; saveState();
     const what = await conversation.cancel(chatId);
     await tg.sendMessage(chatId, what === 'stopping'
@@ -296,9 +419,9 @@ async function onMessage(msg) {
     await tg.sendMessage(chatId, [
       '🎬 How this bot works',
       '',
-      'Just talk to me like a chat — there is no form to fill.',
+      'Just talk to me like a chat — or tap 🎬 Make a video (/make) and I collect the essentials with ready-made buttons.',
       '• Give me a topic and I write the script; give me a full script and I narrate it as-is; send a voice message with your own recorded narration and the video is built from your voice (transcribed, timed, your audio as the track).',
-      '• If something material is missing (style, aspect, whose voice), I will ask with buttons — I will not interrogate you when your request is already clear.',
+      '• The standard choices (style, size, whose voice) are collected by the 🎬 flow with buttons — ready-made, no interrogation. Anything else material that comes up mid-job, the agent asks in one short plain question.',
       '• I send previews and finished videos right here in the chat. Reply in plain words to ask for changes; I revise in the same conversation.',
       '• Tell me a standing preference ("from now on, always 9:16") and I will remember it for every following video.',
       '',
@@ -306,7 +429,7 @@ async function onMessage(msg) {
       '',
       'While I work I may need a permission or a decision — that arrives as a message with buttons; just tap an answer. Nothing is ever auto-approved.',
       '',
-      'Commands: /start — status • /new — fresh conversation • /model — change the current model • /cancel — stop the current turn • /help — this text',
+      'Commands: /start — status • /make — make a video (ready-made choices) • /new — fresh conversation • /model — change the current model • /cancel — stop the current turn • /help — this text',
     ].join('\n'));
     return;
   }
@@ -314,6 +437,21 @@ async function onMessage(msg) {
   // While the /model picker is open, plain text is not a turn.
   if (cs.step === 'pick-provider' || cs.step === 'pick-model') {
     if (text) await tg.sendMessage(chatId, '👆 Pick from the list above — or send /start to go back to chatting.');
+    return;
+  }
+
+  // While the 🎬 flow is open, plain text belongs to the flow: at the
+  // topic stage it IS the topic (or his full script); at the button
+  // stages it just earns a nudge. (/cancel and /start were handled
+  // above and abandon the flow.)
+  if (cs.make && text) {
+    if (cs.make.stage === 'topic') {
+      cs.make.topic = text.trim();
+      cs.make.stage = 'style'; saveState();
+      await askMakeStyle(chatId);
+    } else {
+      await tg.sendMessage(chatId, '👆 Tap one of the options above — or /cancel to stop the video setup.');
+    }
     return;
   }
 
@@ -362,6 +500,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   // never has to configure it in BotFather. Non-fatal if it fails.
   await tg.setMyCommands([
     { command: 'start', description: 'Wake the agent / show status' },
+    { command: 'make', description: 'Make a video (ready-made choices)' },
     { command: 'new', description: 'Start a fresh conversation' },
     { command: 'model', description: 'Change the current model' },
     { command: 'cancel', description: 'Stop the current turn' },

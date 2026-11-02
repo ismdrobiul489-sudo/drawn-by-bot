@@ -76,6 +76,14 @@ const code = await new Promise(resolve => {
 assert.equal(code, 0, 'flow test failed');
 passed++;
 
+console.log('— Make-a-video ready-made flow (child process) —');
+const makeCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/makeflow.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(makeCode, 0, 'makeflow test failed');
+passed++;
+
 console.log('— Permission/question relay (child process, mock OpenCode server) —');
 const relayCode = await new Promise(resolve => {
   const p = spawn('node', ['tests/relay.test.mjs'], { stdio: 'inherit' });
@@ -114,6 +122,14 @@ const tpmCode = await new Promise(resolve => {
   p.on('close', resolve);
 });
 assert.equal(tpmCode, 0, 'TPM fallback test failed');
+passed++;
+
+console.log('— Transient 503 overload retry (child process, mock OpenCode + provider APIs) —');
+const transientCode = await new Promise(resolve => {
+  const p = spawn('node', ['tests/transient503.test.mjs'], { stdio: 'inherit' });
+  p.on('close', resolve);
+});
+assert.equal(transientCode, 0, 'transient 503 test failed');
 passed++;
 
 console.log('— OpenCode server death + respawn (child process, fake opencode binary) —');

@@ -100,6 +100,17 @@ export function isDeadModelError(message) {
   return !isTokenLimitError(m) && DEAD_MODEL_RE.test(m);
 }
 
+// Transient provider overload (live 2026-11-02: a turn died with
+// `OpenCode session error: {"message":"Service temporarily overloaded",
+// "type":"service_unavailable","code":503}`). The model is fine — the
+// SERVICE is momentarily overloaded — so the cure is wait + retry the
+// same turn, NOT a model switch. This class must be checked BEFORE the
+// dead-model matcher: these payloads can carry the word "model".
+const TRANSIENT_RE = /\b503\b|service_unavailable|temporarily overloaded|\boverloaded\b/i;
+export function isTransientError(message) {
+  return TRANSIENT_RE.test(message || '');
+}
+
 /** Our client lost the server itself (process death / unreachable). */
 export function isServerGoneError(e) {
   if (!e) return false;
@@ -124,7 +135,7 @@ export const NUDGE_TEXT = '[System note: you said the file was ready, but nothin
 const FIRST_TURN_PREFIX = [
   '[Conversation start: this is a fresh conversation with the owner. Sessions here cover ONE job each and end when the finished video is delivered — a fresh chat is normal, never act surprised by it; the memory brief above (when present) is your continuity.',
   'You maintain your own memory files: data/memory/preferences.md (standing preferences — update it the moment he states one) and data/memory/index.md (one line per finished video, appended when you send the final file).',
-  'The owner reaches you only through this chat: reply in his language, ask questions with the question tool when something material is missing, and deliver every file with the send_file tool — never claim a file was sent without calling it.]',
+  'The owner reaches you only through this chat: reply in his language; style, aspect and voice are collected by the bot\'s buttons before you are briefed — when a brief says the choices are already made, use them and never re-ask them, and NEVER use the question tool for style, aspect or voice; if something else material is missing, ask ONE short plain-text question and end your turn; never narrate your reasoning or tool intentions in chat — act, then report the result briefly; and deliver every file with the send_file tool — never claim a file was sent without calling it.]',
   '',
 ].join('\n');
 
@@ -631,7 +642,20 @@ export class Conversation {
       return { retryText: `[Note: the previous model failed (token limit / TPM — ${msg.slice(0, 140)}); the standing model was switched to ${other}/${target}. Please continue the user's last request.]\n\n${this.lastUserText(chatId)}` };
     }
 
-    // 4) Dead model mid-turn (probe passed, turn still died of a model
+    // 4) Transient provider overload (503 / service_unavailable): the
+    //    model is fine, the service is momentarily overloaded. Tell the
+    //    owner once, wait out the spike, retry the SAME text once — no
+    //    model switch. (Checked before the dead-model matcher, whose
+    //    /model/i would otherwise swallow these payloads.)
+    if (isTransientError(msg)) {
+      const delaySec = envFloat('TRANSIENT_RETRY_DELAY_SEC', 20);
+      console.log(`[conversation] transient overload chat=${chatId} — waiting ${delaySec}s, then one retry`);
+      await this.tg.sendMessage(chatId, '⚠️ The model service is temporarily overloaded — retrying once…').catch(() => {});
+      await sleep(delaySec * 1000);
+      return { retryText: null }; // null retryText → caller reuses the original text
+    }
+
+    // 5) Dead model mid-turn (probe passed, turn still died of a model
     //    problem): re-resolve once, skipping the model that just failed.
     if (isDeadModelError(msg)) {
       const failed = `${sel.provider}/${sel.model}`;
